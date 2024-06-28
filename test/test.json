@@ -1,0 +1,14 @@
+{
+    "a":42.42,
+    "bs": [1,2,{},4],
+    "obj": {
+        "one":1,
+        "two":2,
+        "empty_array":[]
+    },
+
+    "float": -3.25e-9,
+
+    "answer" :"forty two",
+    "primitives": [true, false, null]
+}
