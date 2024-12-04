@@ -414,9 +414,9 @@ struct CLAP {
 // Macro overloading depending on argument number
 // https://stackoverflow.com/a/11763277/7255197
 #define CLAP_GET_MACRO_3(_1, _2, _3, NAME, ...) NAME
-#define CLAP_REGISTER_OPTION(...)                                       \
-    CLAP_GET_MACRO(__VA_ARGS__, CLAP_REGISTER_OPT_LONG_SHORT,           \
-                   CLAP_REGISTER_OPT_LONG, CLAP_REGISTER_OPT_MINIMAL, ) \
+#define CLAP_REGISTER_OPTION(...)                                         \
+    CLAP_GET_MACRO_3(__VA_ARGS__, CLAP_REGISTER_OPT_LONG_SHORT,           \
+                     CLAP_REGISTER_OPT_LONG, CLAP_REGISTER_OPT_MINIMAL, ) \
     (__VA_ARGS__)
 
 #define CLAP_GET_MACRO_4(_1, _2, _3, _4, NAME, ...) NAME
