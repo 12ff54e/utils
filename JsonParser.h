@@ -2,13 +2,14 @@
 #define ZQ_JSON_PARSER
 
 #include <complex>
+#include <cstdint>
 #include <functional>
 #include <memory>  // unique_ptr
 #include <ostream>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
-#include <variant>
 #include <vector>
 
 namespace json {
@@ -29,7 +30,7 @@ const char* get_value_category_name(ValueCategory);
 
 struct Null {};
 struct NumberInt {
-    int content;
+    int64_t content;
 };
 struct NumberFloat {
     double content;
@@ -56,7 +57,9 @@ struct Value {
     void expected_cat(Ts... cats) const
         requires(std::same_as<Ts, ValueCategory>&&...) {
         if (value_cat == ValueCategory::Null) {
-            throw std::runtime_error("Undefined Property");
+            throw std::runtime_error(
+                "Undefined property (value is Null; accessing a missing key "
+                "via operator[] or a default-constructed Value)");
         }
         if (((value_cat != cats) && ...)) {
             std::ostringstream oss;
@@ -76,18 +79,18 @@ struct Value {
     using array_container_type = std::vector<Value>;
     Value();
 
-    // Type information in deleter is stored during contruction
-    template <typename T>
-    Value(ValueCategory cat, T* raw_ptr)
-        : ptr(raw_ptr,
-              [](const void* data) { delete static_cast<const T*>(data); }),
-          value_cat(cat) {}
-
     template <std::integral T>
     Value(T val) : Value(ValueCategory::NumberInt, new NumberInt{val}) {}
 
     template <std::floating_point T>
     Value(T val) : Value(ValueCategory::NumberFloat, new NumberFloat{val}) {}
+
+    // Non-template overloads are needed for bool and strings: bool is an
+    // integral type, so the template above would otherwise store `true` as
+    // the number 1, and there was no way to build a String Value at all.
+    Value(bool);
+    Value(std::string);
+    Value(const char*);
 
     Value clone() const;
 
@@ -103,6 +106,10 @@ struct Value {
 
     operator double() const;
     operator std::string() const;
+    // without this, `if (v)` would go through operator double() and throw
+    // for non-numbers; truthy means "holds a value" (i.e. not Null).
+    // explicit so that `bool b = v;` still requires as_boolean()
+    explicit operator bool() const;
 
     bool as_boolean() const;
 
@@ -128,6 +135,18 @@ struct Value {
         return as_number<double>() < val;
     }
 
+    template <typename T>
+    bool operator==(
+        T val) const requires std::is_arithmetic_v<std::remove_reference_t<T>> {
+        expected_cat(ValueCategory::NumberFloat, ValueCategory::NumberInt);
+        return as_number<double>() == val;
+    }
+
+    // category and content equality; operator!= is synthesized from it.
+    // The non-template overload wins for exact matches, so `v == 5` still
+    // resolves to the arithmetic template above
+    bool operator==(const Value&) const;
+
 #define define_compond_assignment_operator(op, a_op)                          \
     do {                                                                      \
         expected_cat(ValueCategory::NumberFloat, ValueCategory::NumberInt);   \
@@ -136,7 +155,7 @@ struct Value {
         } else {                                                              \
             if constexpr (std::is_integral_v<std::remove_reference_t<T>>) {   \
                 static_cast<NumberInt*>(ptr.get())                            \
-                    ->content a_op static_cast<int>(val);                     \
+                    ->content a_op static_cast<int64_t>(val);                 \
             } else {                                                          \
                 *this = Value{                                                \
                     ValueCategory::NumberFloat,                               \
@@ -147,12 +166,14 @@ struct Value {
     } while (0)
 
     template <typename T>
-    void operator+=(const T& val) requires std::convertible_to<T, double> {
+    Value& operator+=(const T& val) requires std::convertible_to<T, double> {
         define_compond_assignment_operator(+, +=);
+        return *this;
     }
     template <typename T>
-    void operator-=(const T& val) requires std::convertible_to<T, double> {
+    Value& operator-=(const T& val) requires std::convertible_to<T, double> {
         define_compond_assignment_operator(-, -=);
+        return *this;
     }
 #undef define_compond_assignment_operator
 
@@ -187,15 +208,33 @@ struct Value {
         return *this;
     }
 
+    // bool is convertible to double, so the arithmetic operator= above would
+    // store `true` as the number 1; this overload wins for exact matches
+    Value& operator=(bool);
+
     decltype(auto) operator[](std::integral auto idx) const {
-        return as_array()[idx];
+        // checked like the key overload: out-of-range throws instead of UB
+        try {
+            return as_array().at(idx);
+        } catch (const std::out_of_range&) {
+            throw std::runtime_error("Failed to access index: " +
+                                     std::to_string(idx));
+        }
     }
     decltype(auto) operator[](std::integral auto idx) {
-        return as_array()[idx];
+        try {
+            return as_array().at(idx);
+        } catch (const std::out_of_range&) {
+            throw std::runtime_error("Failed to access index: " +
+                                     std::to_string(idx));
+        }
     }
 
     Value& operator[](const std::string&);
     Value& operator[](const char*);
+    // on a const Value an object key cannot be auto-created; a missing key
+    // throws instead (same as at())
+    const Value& operator[](const std::string&) const;
 
     const Value& at(const std::string&) const;
     const Value& at(std::size_t) const;
@@ -211,11 +250,27 @@ struct Value {
 
     template <typename T>
     const std::vector<T>& as_typed_array() const {
+        static_assert(
+            std::is_same_v<T, std::complex<float>> ||
+                std::is_same_v<T, std::complex<double>>,
+            "as_typed_array only supports std::complex<float> and "
+            "std::complex<double>");
+        expected_cat(std::is_same_v<T, std::complex<float>>
+                         ? ValueCategory::TypedArrayComplexFloat
+                         : ValueCategory::TypedArrayComplexDouble);
         return static_cast<TypedArray<T>*>(ptr.get())->content;
     }
 
     template <typename T>
     std::vector<T>& as_typed_array() {
+        static_assert(
+            std::is_same_v<T, std::complex<float>> ||
+                std::is_same_v<T, std::complex<double>>,
+            "as_typed_array only supports std::complex<float> and "
+            "std::complex<double>");
+        expected_cat(std::is_same_v<T, std::complex<float>>
+                         ? ValueCategory::TypedArrayComplexFloat
+                         : ValueCategory::TypedArrayComplexDouble);
         return static_cast<TypedArray<T>*>(ptr.get())->content;
     }
 
@@ -226,9 +281,13 @@ struct Value {
     bool is_number() const;
     bool is_string() const;
     bool is_boolean() const;
+    bool is_null() const;
+    bool is_typed_array() const;
+    // false when the value is not an object
+    bool contains(const std::string& key) const;
 
     std::size_t size() const;
-    std::size_t empty() const;
+    bool empty() const;
 
     ValueCategory value_category() const;
 
@@ -243,29 +302,49 @@ struct Value {
 
     template <typename T>
     static Value create_typed_array() {
-        if constexpr (std::is_same_v<T, std::complex<double>>) {
-            return {ValueCategory::TypedArrayComplexDouble, new TypedArray<T>};
-        } else if constexpr (std::is_same_v<T, std::complex<float>>) {
-            return {ValueCategory::TypedArrayComplexFloat, new TypedArray<T>};
-        }
+        static_assert(
+            std::is_same_v<T, std::complex<float>> ||
+                std::is_same_v<T, std::complex<double>>,
+            "create_typed_array only supports std::complex<float> and "
+            "std::complex<double>");
+        return {std::is_same_v<T, std::complex<float>>
+                    ? ValueCategory::TypedArrayComplexFloat
+                    : ValueCategory::TypedArrayComplexDouble,
+                new TypedArray<T>};
     }
 
     template <typename T>
     static Value create_typed_array(std::vector<T> vec) {
-        if constexpr (std::is_same_v<T, std::complex<double>>) {
-            return {ValueCategory::TypedArrayComplexDouble,
-                    new TypedArray<T>{vec}};
-        } else if constexpr (std::is_same_v<T, std::complex<float>>) {
-            return {ValueCategory::TypedArrayComplexFloat,
-                    new TypedArray<T>{vec}};
-        }
+        static_assert(
+            std::is_same_v<T, std::complex<float>> ||
+                std::is_same_v<T, std::complex<double>>,
+            "create_typed_array only supports std::complex<float> and "
+            "std::complex<double>");
+        return {std::is_same_v<T, std::complex<float>>
+                    ? ValueCategory::TypedArrayComplexFloat
+                    : ValueCategory::TypedArrayComplexDouble,
+                new TypedArray<T>{std::move(vec)}};
     }
 
    private:
+    // internal constructor: takes ownership of the heap-allocated content
+    // object; the deleter is type-erased, so passing a category that does
+    // not match the dynamic type of T* would be UB
+    template <typename T>
+    Value(ValueCategory cat, T* raw_ptr)
+        : ptr(raw_ptr,
+              [](const void* data) { delete static_cast<const T*>(data); }),
+          value_cat(cat) {}
+
+    friend class JsonParser;
+
     std::unique_ptr<void, std::function<void(void*)>> ptr;
     ValueCategory value_cat;
 
     static void print_space(std::ostream&, std::size_t);
+    static void dump_string(std::ostream&, const std::string&);
+    // shortest round-trip representation, e.g. "0.1" not "0.10000000000000001"
+    static void dump_double(std::ostream&, double);
 };
 
 struct Object {
@@ -315,6 +394,9 @@ struct JsonLexer {
     bool is_buffer_output{};
 
     void read_token_to_buffer();
+    // reads the token body of a string (the opening quote is already
+    // consumed); unescapes escapes, so the token content is the decoded value
+    void read_string_token();
     // any char that can be in a float number
     static bool is_digit(char c);
     static bool is_digit_start(char c);
@@ -322,6 +404,8 @@ struct JsonLexer {
     static bool is_whitespace(char c);
 
     void report_lexical_error() const;
+    void report_lexical_error(const std::string& message) const;
+    static void append_utf8(std::string&, uint32_t);
 };
 
 std::ostream& operator<<(std::ostream& os, const JsonLexer::Token& token);
@@ -332,6 +416,9 @@ struct JsonParser {
 
    private:
     JsonLexer lexer;
+    // guards against stack overflow on hostile/degenerate input
+    static constexpr std::size_t MAX_NESTING_DEPTH = 512;
+    std::size_t depth{};
 
     Value parse_value();
     Value parse_string(const JsonLexer::Token&);
@@ -355,11 +442,24 @@ Value parse_file(std::string);
 
 #ifdef ZQ_JSON_PARSER_IMPLEMENTATION
 
-#include <cstdlib>  // atof, atoi
-#include <cstring>  // strcmp, strlen
+#include <cctype>
+#include <cerrno>
+#include <charconv>
+#include <cmath>
+#include <cstdlib>  // strtod, strtoll
 #include <fstream>  // ifstream
 
 namespace json {
+
+// Shared by the lexer (unescaping "\b", "\n", ...) and Value::dump_string
+// (escaping the same characters back): `letter` is the character following
+// the backslash, `decoded` the character it stands for
+constexpr struct StringEscape {
+    char letter;
+    char decoded;
+} string_escape_table[] = {
+    {'b', '\b'}, {'f', '\f'}, {'n', '\n'}, {'r', '\r'}, {'t', '\t'},
+};
 
 const char* get_value_category_name(ValueCategory val_cat) {
 #define PROCESS_CAT_NAME(p) \
@@ -383,33 +483,26 @@ const char* get_value_category_name(ValueCategory val_cat) {
 
 Value::Value() : value_cat{} {}
 
-Value::Value(const Value& other) : value_cat{} {
-    // value_cat is initialized as Null to prevent accessing non allocated
-    // address
-    *this = other;
+Value::Value(const Value& other) : Value() { *this = other; }
+
+// Deep copy of every category (the old version only accepted "plain" values
+// and threw for Object/Array, which made `Value b = obj;` fail at runtime
+// for no visible reason; use clone() only if you prefer to spell it out)
+Value& Value::operator=(const Value& other) {
+    if (this != &other) { *this = other.clone(); }
+    return *this;
 }
 
-Value& Value::operator=(const Value& other) {
-    other.expected_cat(ValueCategory::Boolean, ValueCategory::NumberFloat,
-                       ValueCategory::NumberInt, ValueCategory::String);
-    // modify content directly with "plain value"
-    if (value_cat == other.value_cat) {
-#define PROCESS_TYPE(t)                                      \
-    case (ValueCategory::t):                                 \
-        static_cast<t*>(ptr.get())->content =                \
-            static_cast<const t*>(other.ptr.get())->content; \
-        break;
-        switch (value_cat) {
-            PROCESS_TYPE(Boolean)
-            PROCESS_TYPE(NumberFloat)
-            PROCESS_TYPE(NumberInt)
-            PROCESS_TYPE(String)
-            default:
-                break;
-        }
-#undef PROCESS_TYPE
+Value::Value(bool val) : Value(ValueCategory::Boolean, new Boolean{val}) {}
+Value::Value(std::string val)
+    : Value(ValueCategory::String, new String{std::move(val)}) {}
+Value::Value(const char* val) : Value(std::string(val)) {}
+
+Value& Value::operator=(bool val) {
+    if (value_cat == ValueCategory::Boolean) {
+        static_cast<Boolean*>(ptr.get())->content = val;
     } else {
-        *this = other.clone();
+        *this = Value{val};
     }
     return *this;
 }
@@ -424,8 +517,58 @@ Value::operator double() const {
 }
 
 bool Value::as_boolean() const {
+    expected_cat(ValueCategory::Boolean);
     return static_cast<Boolean*>(ptr.get())->content;
 };
+
+Value::operator bool() const {
+    return value_cat != ValueCategory::Null;
+}
+
+bool Value::operator==(const Value& other) const {
+    // NumberInt and NumberFloat compare as double, so 1 == 1.0
+    if (is_number() && other.is_number()) {
+        return as_number<double>() == other.as_number<double>();
+    }
+    if (value_cat != other.value_cat) { return false; }
+    switch (value_cat) {
+        case ValueCategory::Null:
+            return true;
+        case ValueCategory::Boolean:
+            return as_boolean() == other.as_boolean();
+        case ValueCategory::String:
+            return as_string() == other.as_string();
+        case ValueCategory::Array: {
+            const auto& lhs = as_array();
+            const auto& rhs = other.as_array();
+            if (lhs.size() != rhs.size()) { return false; }
+            for (std::size_t i = 0; i < lhs.size(); ++i) {
+                if (!(lhs[i] == rhs[i])) { return false; }
+            }
+            return true;
+        }
+        case ValueCategory::Object: {
+            const auto& lhs = as_object();
+            const auto& rhs = other.as_object();
+            if (lhs.size() != rhs.size()) { return false; }
+            for (const auto& [key, val] : lhs) {
+                const auto it = rhs.find(key);
+                if (it == rhs.end() || !(val == it->second)) { return false; }
+            }
+            return true;
+        }
+        case ValueCategory::TypedArrayComplexFloat:
+            return as_typed_array<std::complex<float>>() ==
+                   other.as_typed_array<std::complex<float>>();
+        case ValueCategory::TypedArrayComplexDouble:
+            return as_typed_array<std::complex<double>>() ==
+                   other.as_typed_array<std::complex<double>>();
+        case ValueCategory::NumberInt:
+        case ValueCategory::NumberFloat:
+            return false;  // unreachable, handled by the number check above
+    }
+    return false;  // unreachable
+}
 
 std::string& Value::as_string() {
     expected_cat(ValueCategory::String);
@@ -447,42 +590,40 @@ Value& Value::operator[](const std::string& key) {
 Value& Value::operator[](const char* key) {
     return as_object()[key];
 }
+const Value& Value::operator[](const std::string& key) const {
+    return at(key);
+}
 
 const Value& Value::at(const std::string& key) const {
     try {
         return as_object().at(key);
-    } catch (std::exception& e) {
-        std::ostringstream oss;
-        oss << "Failed to accessing key: " << key;
-        throw std::runtime_error(oss.str());
+    } catch (const std::out_of_range&) {
+        // only wrap a missing key; type errors keep their real message
+        throw std::runtime_error("Failed to access key: " + key);
     }
 }
 const Value& Value::at(std::size_t idx) const {
     try {
         return as_array().at(idx);
-    } catch (std::exception& e) {
-        std::ostringstream oss;
-        oss << "Failed to accessing index: " << idx;
-        throw std::runtime_error(oss.str());
+    } catch (const std::out_of_range&) {
+        throw std::runtime_error("Failed to access index: " +
+                                 std::to_string(idx));
     }
 }
 
 Value& Value::at(const std::string& key) {
     try {
         return as_object().at(key);
-    } catch (std::exception& e) {
-        std::ostringstream oss;
-        oss << "Failed to accessing key: " << key;
-        throw std::runtime_error(oss.str());
+    } catch (const std::out_of_range&) {
+        throw std::runtime_error("Failed to access key: " + key);
     }
 }
 Value& Value::at(std::size_t idx) {
     try {
         return as_array().at(idx);
-    } catch (std::exception& e) {
-        std::ostringstream oss;
-        oss << "Failed to accessing index: " << idx;
-        throw std::runtime_error(oss.str());
+    } catch (const std::out_of_range&) {
+        throw std::runtime_error("Failed to access index: " +
+                                 std::to_string(idx));
     }
 }
 
@@ -520,6 +661,16 @@ bool Value::is_string() const {
 bool Value::is_boolean() const {
     return value_cat == ValueCategory::Boolean;
 }
+bool Value::is_null() const {
+    return value_cat == ValueCategory::Null;
+}
+bool Value::is_typed_array() const {
+    return value_cat == ValueCategory::TypedArrayComplexFloat ||
+           value_cat == ValueCategory::TypedArrayComplexDouble;
+}
+bool Value::contains(const std::string& key) const {
+    return is_object() && as_object().contains(key);
+}
 
 std::size_t Value::size() const {
     expected_cat(ValueCategory::Object, ValueCategory::Array,
@@ -540,12 +691,22 @@ std::size_t Value::size() const {
             return 0;  // unreachable
     }
 }
-std::size_t Value::empty() const {
-    expected_cat(ValueCategory::Object, ValueCategory::Array);
-    if (value_cat == ValueCategory::Object) {
-        return static_cast<Object*>(ptr.get())->content.empty();
-    } else {
-        return static_cast<Array*>(ptr.get())->content.empty();
+bool Value::empty() const {
+    // same category set as size()
+    expected_cat(ValueCategory::Object, ValueCategory::Array,
+                 ValueCategory::TypedArrayComplexFloat,
+                 ValueCategory::TypedArrayComplexDouble);
+    switch (value_cat) {
+        case ValueCategory::Object:
+            return static_cast<Object*>(ptr.get())->content.empty();
+        case ValueCategory::Array:
+            return static_cast<Array*>(ptr.get())->content.empty();
+        case ValueCategory::TypedArrayComplexFloat:
+            return as_typed_array<std::complex<float>>().empty();
+        case ValueCategory::TypedArrayComplexDouble:
+            return as_typed_array<std::complex<double>>().empty();
+        default:
+            return true;  // unreachable
     }
 }
 
@@ -555,13 +716,25 @@ ValueCategory Value::value_category() const {
 
 std::string Value::dump() const {
     std::ostringstream oss;
+    // keeps the element type of the typed array: float parts would
+    // otherwise be printed with all the digits of their double promotion
+    auto dump_complex_part = [&oss]<typename U>(U part) {
+        char buf[32];
+        const auto result = std::to_chars(buf, buf + sizeof buf, part);
+        oss.write(buf, result.ptr - buf);
+    };
     auto dump_typed_array =
-        [&oss]<typename T>(const std::vector<T>& typed_array) {
+        [&oss, &dump_complex_part]<typename T>(
+            const std::vector<T>& typed_array) {
             oss << '[';
             for (std::size_t i = 0; i < typed_array.size(); ++i) {
                 const auto& val = typed_array[i];
                 if (i) { oss << ','; }
-                oss << '[' << val.real() << ',' << val.imag() << ']';
+                oss << '[';
+                dump_complex_part(val.real());
+                oss << ',';
+                dump_complex_part(val.imag());
+                oss << ']';
             }
             oss << ']';
         };
@@ -574,18 +747,19 @@ std::string Value::dump() const {
             oss << (as_boolean() ? "true" : "false");
             break;
         case ValueCategory::NumberInt:
-            oss << as_number<int>();
+            oss << static_cast<NumberInt*>(ptr.get())->content;
             break;
         case ValueCategory::NumberFloat:
-            oss << as_number<double>();
+            dump_double(oss, static_cast<NumberFloat*>(ptr.get())->content);
             break;
         case ValueCategory::String:
-            oss << '"' << static_cast<std::string>(*this) << '"';
+            dump_string(oss, static_cast<String*>(ptr.get())->content);
             break;
         case ValueCategory::Object:
             oss << '{';
             for (const auto& [key, val] : as_object()) {
-                oss << '"' << key << '"' << ':' << val.dump() << ',';
+                dump_string(oss, key);
+                oss << ':' << val.dump() << ',';
             }
             if (!empty()) { oss.seekp(-1, std::ios_base::cur); }
             oss << '}';
@@ -610,14 +784,24 @@ std::string Value::dump() const {
 
 std::string Value::pretty_print(std::size_t indent) const {
     std::ostringstream oss;
+    auto dump_complex_part = [&oss]<typename U>(U part) {
+        char buf[32];
+        const auto result = std::to_chars(buf, buf + sizeof buf, part);
+        oss.write(buf, result.ptr - buf);
+    };
     auto print_typed_array =
-        [&oss, indent]<typename T>(const std::vector<T>& typed_array) {
+        [&oss, indent, &dump_complex_part]<typename T>(
+            const std::vector<T>& typed_array) {
             oss << "[\n";
             for (std::size_t i = 0; i < typed_array.size(); ++i) {
                 const auto& val = typed_array[i];
                 if (i) { oss << ",\n"; }
                 print_space(oss, indent + 4);
-                oss << '[' << val.real() << ", " << val.imag() << ']';
+                oss << '[';
+                dump_complex_part(val.real());
+                oss << ", ";
+                dump_complex_part(val.imag());
+                oss << ']';
             }
             if (typed_array.empty()) {
                 oss.seekp(-1, std::ios_base::cur);
@@ -641,8 +825,8 @@ std::string Value::pretty_print(std::size_t indent) const {
             oss << "{\n";
             for (const auto& [key, val] : as_object()) {
                 print_space(oss, indent + 4);
-                oss << '"' << key << '"' << ": " << val.pretty_print(indent + 4)
-                    << ",\n";
+                dump_string(oss, key);
+                oss << ": " << val.pretty_print(indent + 4) << ",\n";
             }
             if (empty()) {
                 oss.seekp(-1, std::ios_base::cur);
@@ -683,7 +867,9 @@ std::string Value::pretty_print(std::size_t indent) const {
 Value Value::clone() const {
     switch (value_cat) {
         case ValueCategory::NumberInt:
-            return {value_cat, new NumberInt{as_number<int>()}};
+            return {value_cat, new NumberInt{
+                                   static_cast<NumberInt*>(ptr.get())
+                                       ->content}};
             break;
         case ValueCategory::NumberFloat:
             return {value_cat, new NumberFloat{as_number<double>()}};
@@ -722,6 +908,39 @@ Value Value::clone() const {
 
 void Value::print_space(std::ostream& os, std::size_t indent) {
     for (std::size_t i = 0; i < indent; ++i) { os << ' '; }
+}
+
+void Value::dump_double(std::ostream& os, double val) {
+    char buf[32];  // max_digits10 digits + sign + exponent always fits
+    const auto result = std::to_chars(buf, buf + sizeof buf, val);
+    os.write(buf, result.ptr - buf);
+}
+
+void Value::dump_string(std::ostream& os, const std::string& str) {
+    os << '"';
+    for (const char ch : str) {
+        if (ch == '"' || ch == '\\') {
+            os << '\\' << ch;
+            continue;
+        }
+        if (static_cast<unsigned char>(ch) >= 0x20) {
+            os << ch;
+            continue;
+        }
+        // a control character: the shared table or \u00XX as a fallback
+        char letter = '\0';
+        for (const auto& escape : string_escape_table) {
+            if (escape.decoded == ch) { letter = escape.letter; break; }
+        }
+        if (letter != '\0') {
+            os << '\\' << letter;
+        } else {
+            constexpr char hex[] = "0123456789abcdef";
+            os << "\\u00" << hex[static_cast<unsigned char>(ch) >> 4]
+               << hex[static_cast<unsigned char>(ch) & 0xF];
+        }
+    }
+    os << '"';
 }
 
 Value Value::create_object() {
@@ -775,47 +994,31 @@ void JsonLexer::read_token_to_buffer() {
         buffer.col = col;
         ++col;
     } else if (c == '"') {
-        // a string
-        buffer.name = TokenName::STRING;
-        buffer.col = col;
-        ++col;
-        while (is_.get(c) && c != '"') {
-            buffer.content.push_back(c);
-            ++col;
-        }
-        ++col;
+        read_string_token();
     } else if (is_digit_start(c)) {
-        // a number
+        // a number; strict grammar is validated when the value is parsed
         bool is_float{};
         buffer.col = col;
         do {
             buffer.content.push_back(c);
-            is_float |= c == '.';
+            is_float |= c == '.' || c == 'e' || c == 'E';
             ++col;
         } while (is_.get(c) && is_digit(c));
         buffer.name = is_float ? TokenName::FLOAT : TokenName::INTEGER;
         is_.unget();
-    } else if (c == 't' || c == 'f') {
-        // a boolean
+    } else if (c == 't' || c == 'f' || c == 'n') {
+        // a primitive: true, false or null; read char by char instead of
+        // readsome, which returns 0 on some streams (e.g. synced stdin)
         buffer.name = TokenName::PRIMITIVE;
-        char expected[6] = "true";
-        if (c == 'f') { std::strcpy(expected, "false"); }
-        char tmp[6] = {c};
-        is_.readsome(tmp + 1, std::strlen(expected) - 1);
-        if (std::strcmp(tmp, expected) == 0) {
-            buffer.content = expected;
-        } else {
-            report_lexical_error();
-        }
-    } else if (c == 'n') {
-        // null
-        buffer.name = TokenName::PRIMITIVE;
-        char tmp[5] = {c};
-        is_.readsome(tmp + 1, 3);
-        if (std::strcmp(tmp, "null") == 0) {
-            buffer.content = "null";
-        } else {
-            report_lexical_error();
+        buffer.col = col;
+        const char* expected =
+            c == 't' ? "true" : (c == 'f' ? "false" : "null");
+        buffer.content.push_back(c);
+        ++col;
+        for (std::size_t i = 1; expected[i] != '\0'; ++i) {
+            if (!is_.get(c) || c != expected[i]) { report_lexical_error(); }
+            buffer.content.push_back(c);
+            ++col;
         }
     } else {
         report_lexical_error();
@@ -823,6 +1026,102 @@ void JsonLexer::read_token_to_buffer() {
     buffer.row = row;
     is_buffer_full = true;
 }
+
+void JsonLexer::read_string_token() {
+    char c;
+    // reads 4 hex digits after a '\u'; returns UINT32_MAX on malformed input
+    auto read_hex4 = [this, &c]() -> uint32_t {
+        uint32_t value = 0;
+        for (int i = 0; i < 4; ++i) {
+            if (!is_.get(c)) { return UINT32_MAX; }
+            ++col;
+            value <<= 4;
+            if (c >= '0' && c <= '9') {
+                value |= static_cast<uint32_t>(c - '0');
+            } else if (c >= 'a' && c <= 'f') {
+                value |= static_cast<uint32_t>(c - 'a' + 10);
+            } else if (c >= 'A' && c <= 'F') {
+                value |= static_cast<uint32_t>(c - 'A' + 10);
+            } else {
+                return UINT32_MAX;
+            }
+        }
+        return value;
+    };
+
+    buffer.name = TokenName::STRING;
+    buffer.col = col;
+    ++col;  // opening quote
+    while (is_.get(c) && c != '"') {
+        ++col;
+        if (c == '\\') {
+            if (!is_.get(c)) { report_lexical_error("unterminated string"); }
+            ++col;
+            switch (c) {
+                case '"':
+                case '\\':
+                case '/':
+                    buffer.content.push_back(c);
+                    break;
+                case 'u': {
+                    ++col;  // the 'u'
+                    uint32_t code_point = read_hex4();
+                    if (code_point == UINT32_MAX) {
+                        report_lexical_error("invalid \\u escape in string");
+                    }
+                    if (code_point >= 0xD800 && code_point <= 0xDBFF) {
+                        // high surrogate, must be followed by a low one
+                        if (!is_.get(c) || c != '\\' || !is_.get(c) ||
+                            c != 'u') {
+                            report_lexical_error(
+                                "unpaired surrogate in string");
+                        }
+                        ++col;  // the backslash
+                        ++col;  // the 'u'
+                        const uint32_t low = read_hex4();
+                        if (low == UINT32_MAX || low < 0xDC00 ||
+                            low > 0xDFFF) {
+                            report_lexical_error(
+                                "unpaired surrogate in string");
+                        }
+                        code_point =
+                            0x10000 + ((code_point - 0xD800) << 10) +
+                            (low - 0xDC00);
+                    } else if (code_point >= 0xDC00 &&
+                               code_point <= 0xDFFF) {
+                        report_lexical_error("unpaired surrogate in string");
+                    }
+                    append_utf8(buffer.content, code_point);
+                    break;
+                }
+                default: {
+                    // the common escapes: \b \f \n \r \t (shared with
+                    // Value::dump_string); '\0' never decodes to a value
+                    char decoded = '\0';
+                    for (const auto& escape : string_escape_table) {
+                        if (escape.letter == c) {
+                            decoded = escape.decoded;
+                            break;
+                        }
+                    }
+                    if (decoded == '\0') {
+                        report_lexical_error(
+                            "invalid escape sequence in string");
+                    }
+                    buffer.content.push_back(decoded);
+                }
+            }
+        } else if (static_cast<unsigned char>(c) < 0x20) {
+            // JSON strings may not contain raw control characters
+            report_lexical_error("control character in string");
+        } else {
+            buffer.content.push_back(c);
+        }
+    }
+    if (!is_) { report_lexical_error("unterminated string"); }
+    ++col;  // closing quote
+}
+
 JsonLexer::operator bool() const {
     return !is_.fail();
 }
@@ -837,10 +1136,30 @@ bool JsonLexer::is_whitespace(char c) {
 }
 
 void JsonLexer::report_lexical_error() const {
+    report_lexical_error("unrecognized token");
+}
+void JsonLexer::report_lexical_error(const std::string& message) const {
     std::ostringstream oss;
-    oss << filename << ':' << row << ':' << col
-        << ": error: unrecognized token";
+    oss << filename << ':' << row << ':' << col << ": error: " << message;
     throw std::runtime_error(oss.str());
+}
+
+void JsonLexer::append_utf8(std::string& out, uint32_t code_point) {
+    if (code_point <= 0x7F) {
+        out.push_back(static_cast<char>(code_point));
+    } else if (code_point <= 0x7FF) {
+        out.push_back(static_cast<char>(0xC0 | (code_point >> 6)));
+        out.push_back(static_cast<char>(0x80 | (code_point & 0x3F)));
+    } else if (code_point <= 0xFFFF) {
+        out.push_back(static_cast<char>(0xE0 | (code_point >> 12)));
+        out.push_back(static_cast<char>(0x80 | ((code_point >> 6) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | (code_point & 0x3F)));
+    } else {
+        out.push_back(static_cast<char>(0xF0 | (code_point >> 18)));
+        out.push_back(static_cast<char>(0x80 | ((code_point >> 12) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | ((code_point >> 6) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | (code_point & 0x3F)));
+    }
 }
 
 JsonParser::JsonParser(JsonLexer&& json_lexer) : lexer(std::move(json_lexer)) {}
@@ -854,23 +1173,39 @@ Value JsonParser::parse() {
 
 Value JsonParser::parse_value() {
     auto token = try_get_from_lexer();
+    if (depth >= MAX_NESTING_DEPTH) {
+        std::ostringstream oss;
+        oss << lexer.get_filename() << ':' << token.row << ':' << token.col
+            << ": error: JSON nesting too deep (exceeds "
+            << MAX_NESTING_DEPTH << ')';
+        throw std::runtime_error(oss.str());
+    }
+    ++depth;
+    Value result;
     switch (token.name) {
         case JsonLexer::TokenName::STRING:
-            return parse_string(token);
+            result = parse_string(token);
+            break;
         case JsonLexer::TokenName::INTEGER:
-            return parse_int(token);
+            result = parse_int(token);
+            break;
         case JsonLexer::TokenName::FLOAT:
-            return parse_float(token);
+            result = parse_float(token);
+            break;
         case JsonLexer::TokenName::BRACE_LEFT:
-            return parse_object();
+            result = parse_object();
+            break;
         case JsonLexer::TokenName::BRACKET_LEFT:
-            return parse_array();
+            result = parse_array();
+            break;
         case JsonLexer::TokenName::PRIMITIVE:
-            return parse_primitive(token);
+            result = parse_primitive(token);
+            break;
         default:
-            report_syntax_error(token);
-            return Value{};  // unreachable
+            report_syntax_error(token);  // unreachable
     }
+    --depth;
+    return result;
 }
 
 Value JsonParser::parse_string(const JsonLexer::Token& token) {
@@ -884,15 +1219,72 @@ Value JsonParser::parse_int(const JsonLexer::Token& token) {
     if (token.name != JsonLexer::TokenName::INTEGER) {
         report_syntax_error(token);
     }
-    return {ValueCategory::NumberInt,
-            new NumberInt{std::atoi(token.content.c_str())}};
+    // strict JSON integer: '-'? digit+ (no leading zero, no trailing junk).
+    // atoi/strtol silently stop at the first invalid character, so the whole
+    // token is validated first: "1e5" or "1.2" must not parse as the int 1.
+    const char* str = token.content.c_str();
+    const char* p = str;
+    if (*p == '-') { ++p; }
+    if (!std::isdigit(static_cast<unsigned char>(*p))) {
+        report_syntax_error(token);
+    }
+    if (*p == '0') {
+        ++p;
+        if (std::isdigit(static_cast<unsigned char>(*p))) {
+            report_syntax_error(token);
+        }
+    } else {
+        while (std::isdigit(static_cast<unsigned char>(*p))) { ++p; }
+    }
+    if (*p != '\0') { report_syntax_error(token); }
+    errno = 0;
+    const long long content = std::strtoll(str, nullptr, 10);
+    if (errno == ERANGE) { report_syntax_error(token); }
+    return {ValueCategory::NumberInt, new NumberInt{content}};
 }
 Value JsonParser::parse_float(const JsonLexer::Token& token) {
     if (token.name != JsonLexer::TokenName::FLOAT) {
         report_syntax_error(token);
     }
-    return {ValueCategory::NumberFloat,
-            new NumberFloat{std::atof(token.content.c_str())}};
+    // strict JSON number: '-'? digit+ ('.' digit+)? (('e'|'E') ('+'|'-')?
+    // digit+)? with no leading zero and no trailing junk, so that "1.2.3"
+    // or "1e" is rejected instead of silently truncated by strtod.
+    const char* str = token.content.c_str();
+    const char* p = str;
+    if (*p == '-') { ++p; }
+    if (!std::isdigit(static_cast<unsigned char>(*p))) {
+        report_syntax_error(token);
+    }
+    if (*p == '0') {
+        ++p;
+        if (std::isdigit(static_cast<unsigned char>(*p))) {
+            report_syntax_error(token);
+        }
+    } else {
+        while (std::isdigit(static_cast<unsigned char>(*p))) { ++p; }
+    }
+    if (*p == '.') {
+        ++p;
+        if (!std::isdigit(static_cast<unsigned char>(*p))) {
+            report_syntax_error(token);
+        }
+        while (std::isdigit(static_cast<unsigned char>(*p))) { ++p; }
+    }
+    if (*p == 'e' || *p == 'E') {
+        ++p;
+        if (*p == '+' || *p == '-') { ++p; }
+        if (!std::isdigit(static_cast<unsigned char>(*p))) {
+            report_syntax_error(token);
+        }
+        while (std::isdigit(static_cast<unsigned char>(*p))) { ++p; }
+    }
+    if (*p != '\0') { report_syntax_error(token); }
+    errno = 0;
+    const double content = std::strtod(str, nullptr);
+    if (errno == ERANGE || !std::isfinite(content)) {
+        report_syntax_error(token);
+    }
+    return {ValueCategory::NumberFloat, new NumberFloat{content}};
 }
 Value JsonParser::parse_primitive(const JsonLexer::Token& token) {
     if (token.name != JsonLexer::TokenName::PRIMITIVE) {
@@ -970,7 +1362,14 @@ JsonLexer::Token JsonParser::try_peek_from_lexer() {
 void JsonParser::report_syntax_error(const JsonLexer::Token& token) {
     std::ostringstream oss;
     oss << lexer.get_filename() << ':' << token.row << ':' << token.col
-        << ": error: unexpected content '" << token.content << '\'';
+        << ": error: ";
+    if (token.name == JsonLexer::TokenName::END_OF_FILE) {
+        // the EOF token has no content; "''" would read as a parse bug
+        // instead of a truncated document
+        oss << "unexpected end of input";
+    } else {
+        oss << "unexpected content '" << token.content << '\'';
+    }
     throw std::runtime_error(oss.str());
 }
 

@@ -130,5 +130,76 @@ int main() {
 
         std::cout << '\n' << obj.pretty_print() << '\n';
     }
+    {  // test bool values and string creation
+        auto obj = Value::create_object();
+        obj["flag"] = true;
+        obj["off"] = false;
+        std::cout << "Boolean assignment: " << obj["flag"].dump() << ", "
+                  << obj["off"].dump() << " ("
+                  << get_value_category_name(obj["flag"].value_category())
+                  << ")\n";
+        Value b{true};
+        std::cout << "Value{true} is "
+                  << get_value_category_name(b.value_category()) << '\n';
+        Value s{"direct string"};
+        std::cout << "Value{\"direct string\"} dumps as " << s.dump() << '\n';
+    }
+    {  // test copying an object value (used to throw)
+        auto obj = parse("{\"a\": [1, 2, 3], \"o\": {\"x\": 9}}");
+        Value copy = obj;
+        copy["a"].as_array()[0] = 100;
+        std::cout << "Copy of object is independent: " << obj.dump()
+                  << " vs " << copy.dump() << '\n';
+    }
+    {  // test strict number parsing and scientific notation
+        auto v = parse("[1e5, 2E3, 1.5e-2, 123456789012345]");
+        std::cout << "Scientific notation: " << v.dump() << '\n';
+        for (const char* bad : {"[1.2.3]", "[1e]", "[-,5]", "[007]", "[1.]",
+                                "[1e999]"}) {
+            try {
+                parse(bad);
+                std::cout << "FAIL: " << bad << " should be rejected\n";
+            } catch (std::exception& e) {
+                std::cout << "Rejected " << bad << ": " << e.what() << '\n';
+            }
+        }
+    }
+    {  // test string escapes
+        auto v = parse("{\"n\": \"x\\ny\", \"q\": \"he said \\\"hi\\\"\", "
+                       "\"u\": \"\\u00e9\"}");
+        std::cout << "Escapes decoded: " << v.dump() << '\n';
+        try {
+            parse("\"unterminated");
+        } catch (std::exception& e) {
+            std::cout << "Unterminated string: " << e.what() << '\n';
+        }
+    }
+    {  // test int64 arithmetic, out-of-range indexing and truthiness
+        auto v = parse("[0, 1, 2]");
+        v[0] += 5'000'000'000LL;
+        std::cout << "int64 += 5000000000: " << v[0].dump() << '\n';
+        try {
+            static_cast<void>(v[10]);
+        } catch (std::exception& e) {
+            std::cout << "Out-of-range index: " << e.what() << '\n';
+        }
+        std::cout << "Truthiness: object=" << !!parse("{}")
+                  << ", null=" << !!parse("null")
+                  << ", zero=" << !!parse("0") << '\n';
+    }
+    {  // test Value == Value
+        auto doc = parse("[1, {\"a\": \"x\"}, [true, null], 2.0]");
+        std::cout << "Round trip equals: "
+                  << (parse(doc.dump()) == doc) << '\n';
+        std::cout << "Different docs: "
+                  << (parse("[1, 2]") != parse("[1, 2, 3]")) << '\n';
+    }
+    {  // test error message for truncated input
+        try {
+            parse("{\"a\": [1, 2");
+        } catch (std::exception& e) {
+            std::cout << "Truncated input: " << e.what() << '\n';
+        }
+    }
     return 0;
 }
