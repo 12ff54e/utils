@@ -1,18 +1,127 @@
 #ifndef ZQ_JSON_PARSER
 #define ZQ_JSON_PARSER
 
+#include <algorithm>
 #include <complex>
+#include <concepts>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>  // unique_ptr
+#include <memory_resource>
+#include <new>
 #include <ostream>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <type_traits>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace json {
+
+// Bump allocation in blocks. Individual deallocations do nothing; destruction
+// or release() returns the blocks to upstream. Upstream must outlive this
+// arena.
+class Arena : public std::pmr::memory_resource {
+   public:
+    explicit Arena(
+        std::size_t block_size = 4096,
+        std::pmr::memory_resource* upstream = std::pmr::get_default_resource());
+    ~Arena() override;
+    Arena(const Arena&) = delete;
+    Arena& operator=(const Arena&) = delete;
+    Arena(Arena&&) = delete;
+    Arena& operator=(Arena&&) = delete;
+
+    // All objects using this arena's storage must be destroyed before release.
+    void release() noexcept;
+    std::pmr::memory_resource* upstream_resource() const { return upstream_; }
+
+   private:
+    struct Block {
+        Block* next;
+        std::size_t bytes;
+        void* cursor;
+        std::size_t available;
+    };
+    Block* head_{};
+    std::size_t block_size_;
+    std::pmr::memory_resource* upstream_;
+
+    void* do_allocate(std::size_t bytes, std::size_t alignment) override;
+    void do_deallocate(void*, std::size_t, std::size_t) override {}
+    bool do_is_equal(
+        const std::pmr::memory_resource& other) const noexcept override {
+        return this == &other;
+    }
+};
+
+// STL allocator backed by a memory_resource. The default owns an Arena; a raw
+// resource pointer borrows it, and a shared_ptr shares ownership with the
+// caller.
+template <typename T>
+class Allocator {
+   public:
+    using value_type = T;
+    using propagate_on_container_copy_assignment = std::false_type;
+    using propagate_on_container_move_assignment = std::false_type;
+    using propagate_on_container_swap = std::true_type;
+    using is_always_equal = std::false_type;
+
+    Allocator() : resource_(std::make_shared<Arena>()) {}
+    Allocator(std::pmr::memory_resource* resource)
+        : resource_(std::shared_ptr<std::pmr::memory_resource>{}, resource) {
+        if (!resource) { throw std::invalid_argument("Null JSON resource"); }
+    }
+    template <std::derived_from<std::pmr::memory_resource> Resource>
+    Allocator(std::shared_ptr<Resource> resource)
+        : resource_(std::move(resource)) {
+        if (!resource_) { throw std::invalid_argument("Null JSON resource"); }
+    }
+    Allocator(const Allocator&) noexcept = default;
+    Allocator& operator=(const Allocator&) noexcept = default;
+    // Keep moved-from containers and values usable.
+    Allocator(Allocator&& other) noexcept : resource_(other.resource_) {}
+    Allocator& operator=(Allocator&& other) noexcept {
+        resource_ = other.resource_;
+        return *this;
+    }
+    template <typename U>
+    Allocator(const Allocator<U>& other) noexcept
+        : resource_(other.resource_) {}
+
+    T* allocate(std::size_t n) {
+        if (n > std::numeric_limits<std::size_t>::max() / sizeof(T)) {
+            throw std::bad_array_new_length();
+        }
+        return static_cast<T*>(resource_->allocate(n * sizeof(T), alignof(T)));
+    }
+    void deallocate(T* data, std::size_t n) {
+        resource_->deallocate(data, n * sizeof(T), alignof(T));
+    }
+    template <typename U, typename... Args>
+    void construct(U* data, Args&&... args) {
+        std::uninitialized_construct_using_allocator(
+            data, *this, std::forward<Args>(args)...);
+    }
+    std::pmr::memory_resource* resource() const noexcept {
+        return resource_.get();
+    }
+
+    template <typename U>
+    bool operator==(const Allocator<U>& other) const noexcept {
+        return *resource_ == *other.resource_;
+    }
+
+   private:
+    template <typename>
+    friend class Allocator;
+    std::shared_ptr<std::pmr::memory_resource> resource_;
+};
 
 enum class ValueCategory {
     Null = 0,
@@ -451,6 +560,55 @@ Value parse_file(std::string);
 #include <fstream>  // ifstream
 
 namespace json {
+
+Arena::Arena(std::size_t block_size, std::pmr::memory_resource* upstream)
+    : block_size_(block_size), upstream_(upstream) {
+    if (!block_size || !upstream) {
+        throw std::invalid_argument("Arena needs a block size and upstream");
+    }
+}
+
+Arena::~Arena() {
+    release();
+}
+
+void Arena::release() noexcept {
+    while (head_) {
+        auto* block = head_;
+        head_ = block->next;
+        const auto bytes = block->bytes;
+        std::destroy_at(block);
+        upstream_->deallocate(block, bytes, alignof(Block));
+    }
+}
+
+void* Arena::do_allocate(std::size_t bytes, std::size_t alignment) {
+    bytes = std::max(bytes, std::size_t{1});
+    const auto try_block = [&]() -> void* {
+        if (!head_) { return nullptr; }
+        if (std::align(alignment, bytes, head_->cursor, head_->available)) {
+            auto* result = static_cast<std::byte*>(head_->cursor);
+            head_->cursor = result + bytes;
+            head_->available -= bytes;
+            return result;
+        }
+        return nullptr;
+    };
+    if (auto* result = try_block()) { return result; }
+
+    const auto capacity = std::max(bytes, block_size_);
+    constexpr auto max_size = std::numeric_limits<std::size_t>::max();
+    if (alignment - 1 > max_size - sizeof(Block) ||
+        capacity > max_size - sizeof(Block) - (alignment - 1)) {
+        throw std::bad_alloc();
+    }
+    const auto total = sizeof(Block) + capacity + alignment - 1;
+    auto* storage =
+        static_cast<std::byte*>(upstream_->allocate(total, alignof(Block)));
+    head_ = std::construct_at(reinterpret_cast<Block*>(storage), head_, total,
+                              storage + sizeof(Block), total - sizeof(Block));
+    return try_block();
+}
 
 // Shared by the lexer (unescaping "\b", "\n", ...) and Value::dump_string
 // (escaping the same characters back): `letter` is the character following

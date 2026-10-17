@@ -23,8 +23,8 @@ check: $(TESTS) check-clap-help
 	    printf 'Running %s\n' "$$test"; "$$test"; \
 	done
 
-check-json: $(BLD)/json_test
-	$<
+check-json: $(BLD)/json_test $(BLD)/json_allocator_test
+	@set -e; for test in $^; do "$$test"; done
 
 check-timer: $(BLD)/timer_test
 	$<
