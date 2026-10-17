@@ -401,6 +401,49 @@ void test_container_assignment() {
     CHECK(first_stats.live_bytes == 0 && second_stats.live_bytes == 0);
 }
 
+void test_replacing_values() {
+    static_assert(std::is_nothrow_move_constructible_v<json::Value>);
+    static_assert(std::is_nothrow_destructible_v<json::Value>);
+    const std::array values{
+        json::Value{},
+        json::Value(42),
+        json::Value(2.5),
+        json::Value(true),
+        json::Value("a long string with allocated character storage"),
+        json::parse(R"([{"nested":"a long string inside an array"}])"),
+        json::parse(
+            R"({"a long object key with allocated storage":[null,42]})"),
+        json::Value::create_typed_array(
+            std::vector<std::complex<double>>{{1., 2.}, {3., 4.}}),
+        json::Value::create_typed_array(
+            std::vector<std::complex<float>>{{1.f, 2.f}, {3.f, 4.f}})};
+    ResourceStats stats;
+    TrackingResource resource(stats);
+    for (const auto& before : values) {
+        for (const auto& after : values) {
+            {
+                auto value = before.clone(&resource);
+                value = after;
+                CHECK(value == after);
+                check_resource(value, &resource);
+            }
+            CHECK(stats.live_bytes == 0);
+            {
+                auto value = before.clone(&resource);
+                auto source = after.clone(&resource);
+                value = std::move(source);
+                CHECK(source.is_null());
+                CHECK(value == after);
+                check_resource(value, &resource);
+                value = json::Value(&resource);
+                CHECK(value.is_null());
+                CHECK(stats.live_bytes == 0);
+            }
+            CHECK(stats.allocations == stats.deallocations);
+        }
+    }
+}
+
 void test_equivalent_resources() {
     ResourceStats stats;
     auto upstream = std::make_shared<TrackingResource>(stats);
@@ -645,6 +688,7 @@ int main() {
         test_parser_resources();
         test_value_assignment();
         test_container_assignment();
+        test_replacing_values();
         test_equivalent_resources();
         test_escaped_storage();
         test_descendant_assignment();

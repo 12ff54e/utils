@@ -9,7 +9,7 @@
 #include <functional>
 #include <iterator>
 #include <limits>
-#include <memory>  // unique_ptr
+#include <memory>
 #include <memory_resource>
 #include <new>
 #include <ostream>
@@ -239,6 +239,7 @@ struct Value {
     Value(std::string, allocator_type = {});
     Value(std::string_view, allocator_type = {});
     Value(const char*, allocator_type = {});
+    ~Value() noexcept;
 
     // Copies share the resource, but own independent contents.
     Value clone() const;
@@ -279,9 +280,9 @@ struct Value {
         const requires std::is_arithmetic_v<std::remove_reference_t<T>> {
         expected_cat(ValueCategory::NumberFloat, ValueCategory::NumberInt);
         if (value_cat == ValueCategory::NumberFloat) {
-            return static_cast<NumberFloat*>(ptr.get())->content;
+            return static_cast<NumberFloat*>(ptr)->content;
         } else {
-            return static_cast<NumberInt*>(ptr.get())->content;
+            return static_cast<NumberInt*>(ptr)->content;
         }
         return T{};
     }
@@ -308,21 +309,20 @@ struct Value {
     // resolves to the arithmetic template above
     bool operator==(const Value&) const;
 
-#define define_compond_assignment_operator(op, a_op)                          \
-    do {                                                                      \
-        expected_cat(ValueCategory::NumberFloat, ValueCategory::NumberInt);   \
-        if (value_cat == ValueCategory::NumberFloat) {                        \
-            static_cast<NumberFloat*>(ptr.get())->content a_op val;           \
-        } else {                                                              \
-            if constexpr (std::is_integral_v<std::remove_reference_t<T>>) {   \
-                static_cast<NumberInt*>(ptr.get())                            \
-                    ->content a_op static_cast<int64_t>(val);                 \
-            } else {                                                          \
-                *this =                                                       \
-                    Value{static_cast<NumberInt*>(ptr.get())->content op val, \
-                          allocator_};                                        \
-            }                                                                 \
-        }                                                                     \
+#define define_compond_assignment_operator(op, a_op)                        \
+    do {                                                                    \
+        expected_cat(ValueCategory::NumberFloat, ValueCategory::NumberInt); \
+        if (value_cat == ValueCategory::NumberFloat) {                      \
+            static_cast<NumberFloat*>(ptr)->content a_op val;               \
+        } else {                                                            \
+            if constexpr (std::is_integral_v<std::remove_reference_t<T>>) { \
+                static_cast<NumberInt*>(ptr)                                \
+                    ->content a_op static_cast<int64_t>(val);               \
+            } else {                                                        \
+                *this = Value{static_cast<NumberInt*>(ptr)->content op val, \
+                              allocator_};                                  \
+            }                                                               \
+        }                                                                   \
     } while (0)
 
     template <typename T>
@@ -341,12 +341,12 @@ struct Value {
     decltype(auto) operator=(T val) requires std::convertible_to<T, double> {
         if (value_cat == ValueCategory::NumberInt) {
             if constexpr (std::is_integral_v<std::remove_reference_t<T>>) {
-                static_cast<NumberInt*>(ptr.get())->content = val;
+                static_cast<NumberInt*>(ptr)->content = val;
             } else {
                 *this = Value{static_cast<double>(val), allocator_};
             }
         } else if (value_cat == ValueCategory::NumberFloat) {
-            static_cast<NumberFloat*>(ptr.get())->content = val;
+            static_cast<NumberFloat*>(ptr)->content = val;
         } else {
             if constexpr (std::is_integral_v<std::remove_reference_t<T>>) {
                 *this = Value{static_cast<int64_t>(val), allocator_};
@@ -421,7 +421,7 @@ struct Value {
         expected_cat(std::is_same_v<T, std::complex<float>>
                          ? ValueCategory::TypedArrayComplexFloat
                          : ValueCategory::TypedArrayComplexDouble);
-        return static_cast<TypedArray<T>*>(ptr.get())->content;
+        return static_cast<TypedArray<T>*>(ptr)->content;
     }
 
     template <typename T>
@@ -434,7 +434,7 @@ struct Value {
         expected_cat(std::is_same_v<T, std::complex<float>>
                          ? ValueCategory::TypedArrayComplexFloat
                          : ValueCategory::TypedArrayComplexDouble);
-        return static_cast<TypedArray<T>*>(ptr.get())->content;
+        return static_cast<TypedArray<T>*>(ptr)->content;
     }
 
     // queries
@@ -498,12 +498,6 @@ struct Value {
     }
 
    private:
-    struct NodeDeleter {
-        std::pmr::memory_resource* resource{};
-        void (*destroy)(void*, std::pmr::memory_resource*) noexcept {};
-        void operator()(void* data) const noexcept { destroy(data, resource); }
-    };
-
     template <typename T, typename... Args>
     static Value make_node_(ValueCategory cat,
                             allocator_type allocator,
@@ -517,24 +511,17 @@ struct Value {
             node_allocator.deallocate(node, 1);
             throw;
         }
-        result.ptr = std::unique_ptr<void, NodeDeleter>(
-            node,
-            NodeDeleter{
-                allocator.resource(),
-                [](void* data, std::pmr::memory_resource* resource) noexcept {
-                    auto* typed = static_cast<T*>(data);
-                    std::destroy_at(typed);
-                    resource->deallocate(typed, sizeof(T), alignof(T));
-                }});
+        result.ptr = node;
         result.value_cat = cat;
         return result;
     }
 
     friend struct JsonParser;
 
-    // The resource owner must outlive payload and container destruction.
+    // clear_() destroys the payload before the resource owner is released.
     allocator_type allocator_;
-    std::unique_ptr<void, NodeDeleter> ptr{nullptr, NodeDeleter{}};
+    // Null has no payload; value_cat identifies the pointed-to wrapper.
+    void* ptr{};
     ValueCategory value_cat = ValueCategory::Null;
 
     void assign_string_(std::string_view);
@@ -735,6 +722,9 @@ const char* get_value_category_name(ValueCategory val_cat) {
 
 Value::Value() : Value(allocator_type{}) {}
 Value::Value(allocator_type allocator) : allocator_(std::move(allocator)) {}
+Value::~Value() noexcept {
+    clear_();
+}
 
 Value::Value(const Value& other) : Value(other.clone()) {}
 Value::Value(const Value& other, allocator_type allocator)
@@ -742,7 +732,7 @@ Value::Value(const Value& other, allocator_type allocator)
 
 Value::Value(Value&& other) noexcept
     : allocator_(other.allocator_),
-      ptr(std::move(other.ptr)),
+      ptr(std::exchange(other.ptr, nullptr)),
       value_cat(std::exchange(other.value_cat, ValueCategory::Null)) {}
 
 Value::Value(Value&& other, allocator_type allocator)
@@ -774,18 +764,51 @@ Value& Value::operator=(Value&& other) {
 }
 
 void Value::clear_() noexcept {
-    ptr.reset();
-    value_cat = ValueCategory::Null;
+    auto* node = std::exchange(ptr, nullptr);
+    const auto cat = std::exchange(value_cat, ValueCategory::Null);
+    const auto destroy = [this, node]<typename T>() noexcept {
+        auto* typed = static_cast<T*>(node);
+        std::destroy_at(typed);
+        allocator_.resource()->deallocate(typed, sizeof(T), alignof(T));
+    };
+    switch (cat) {
+        case ValueCategory::Null:
+            break;
+        case ValueCategory::NumberInt:
+            destroy.operator()<NumberInt>();
+            break;
+        case ValueCategory::NumberFloat:
+            destroy.operator()<NumberFloat>();
+            break;
+        case ValueCategory::Boolean:
+            destroy.operator()<Boolean>();
+            break;
+        case ValueCategory::String:
+            destroy.operator()<String>();
+            break;
+        case ValueCategory::Array:
+            destroy.operator()<Array>();
+            break;
+        case ValueCategory::Object:
+            destroy.operator()<Object>();
+            break;
+        case ValueCategory::TypedArrayComplexDouble:
+            destroy.operator()<TypedArray<std::complex<double>>>();
+            break;
+        case ValueCategory::TypedArrayComplexFloat:
+            destroy.operator()<TypedArray<std::complex<float>>>();
+            break;
+    }
 }
 
 void Value::take_payload_(Value& other) noexcept {
-    ptr = std::move(other.ptr);
-    ptr.get_deleter().resource = allocator_.resource();
+    clear_();
+    ptr = std::exchange(other.ptr, nullptr);
     value_cat = std::exchange(other.value_cat, ValueCategory::Null);
 }
 
 void Value::swap_payload_(Value& other) noexcept {
-    ptr.swap(other.ptr);
+    std::swap(ptr, other.ptr);
     std::swap(value_cat, other.value_cat);
 }
 
@@ -805,7 +828,7 @@ Value::Value(const char* val, allocator_type allocator)
 
 void Value::assign_string_(std::string_view val) {
     if (value_cat == ValueCategory::String) {
-        static_cast<String*>(ptr.get())->content.assign(val);
+        static_cast<String*>(ptr)->content.assign(val);
     } else {
         *this = Value{val, allocator_};
     }
@@ -813,7 +836,7 @@ void Value::assign_string_(std::string_view val) {
 
 Value& Value::operator=(bool val) {
     if (value_cat == ValueCategory::Boolean) {
-        static_cast<Boolean*>(ptr.get())->content = val;
+        static_cast<Boolean*>(ptr)->content = val;
     } else {
         *this = Value{val, allocator_};
     }
@@ -823,15 +846,15 @@ Value& Value::operator=(bool val) {
 Value::operator double() const {
     expected_cat(ValueCategory::NumberFloat, ValueCategory::NumberInt);
     if (value_cat == ValueCategory::NumberFloat) {
-        return static_cast<NumberFloat*>(ptr.get())->content;
+        return static_cast<NumberFloat*>(ptr)->content;
     } else {
-        return static_cast<NumberInt*>(ptr.get())->content;
+        return static_cast<NumberInt*>(ptr)->content;
     }
 }
 
 bool Value::as_boolean() const {
     expected_cat(ValueCategory::Boolean);
-    return static_cast<Boolean*>(ptr.get())->content;
+    return static_cast<Boolean*>(ptr)->content;
 };
 
 Value::operator bool() const {
@@ -885,11 +908,11 @@ bool Value::operator==(const Value& other) const {
 
 Value::string_type& Value::as_string() {
     expected_cat(ValueCategory::String);
-    return static_cast<String*>(ptr.get())->content;
+    return static_cast<String*>(ptr)->content;
 }
 const Value::string_type& Value::as_string() const {
     expected_cat(ValueCategory::String);
-    return static_cast<String*>(ptr.get())->content;
+    return static_cast<String*>(ptr)->content;
 }
 
 Value::operator std::string() const {
@@ -945,20 +968,20 @@ Value& Value::at(std::size_t idx) {
 
 const Value::object_container_type& Value::as_object() const {
     expected_cat(ValueCategory::Object);
-    return static_cast<Object*>(ptr.get())->content;
+    return static_cast<Object*>(ptr)->content;
 }
 const Value::array_container_type& Value::as_array() const {
     expected_cat(ValueCategory::Array);
-    return static_cast<Array*>(ptr.get())->content;
+    return static_cast<Array*>(ptr)->content;
 }
 
 Value::object_container_type& Value::as_object() {
     expected_cat(ValueCategory::Object);
-    return static_cast<Object*>(ptr.get())->content;
+    return static_cast<Object*>(ptr)->content;
 }
 Value::array_container_type& Value::as_array() {
     expected_cat(ValueCategory::Array);
-    return static_cast<Array*>(ptr.get())->content;
+    return static_cast<Array*>(ptr)->content;
 }
 
 bool Value::is_object() const {
@@ -994,14 +1017,14 @@ std::size_t Value::size() const {
                  ValueCategory::TypedArrayComplexDouble);
     switch (value_cat) {
         case ValueCategory::Object:
-            return static_cast<Object*>(ptr.get())->content.size();
+            return static_cast<Object*>(ptr)->content.size();
         case ValueCategory::Array:
-            return static_cast<Array*>(ptr.get())->content.size();
+            return static_cast<Array*>(ptr)->content.size();
         case ValueCategory::TypedArrayComplexFloat:
-            return static_cast<TypedArray<std::complex<float>>*>(ptr.get())
+            return static_cast<TypedArray<std::complex<float>>*>(ptr)
                 ->content.size();
         case ValueCategory::TypedArrayComplexDouble:
-            return static_cast<TypedArray<std::complex<double>>*>(ptr.get())
+            return static_cast<TypedArray<std::complex<double>>*>(ptr)
                 ->content.size();
         default:
             return 0;  // unreachable
@@ -1014,9 +1037,9 @@ bool Value::empty() const {
                  ValueCategory::TypedArrayComplexDouble);
     switch (value_cat) {
         case ValueCategory::Object:
-            return static_cast<Object*>(ptr.get())->content.empty();
+            return static_cast<Object*>(ptr)->content.empty();
         case ValueCategory::Array:
-            return static_cast<Array*>(ptr.get())->content.empty();
+            return static_cast<Array*>(ptr)->content.empty();
         case ValueCategory::TypedArrayComplexFloat:
             return as_typed_array<std::complex<float>>().empty();
         case ValueCategory::TypedArrayComplexDouble:
@@ -1062,13 +1085,13 @@ std::string Value::dump() const {
             oss << (as_boolean() ? "true" : "false");
             break;
         case ValueCategory::NumberInt:
-            oss << static_cast<NumberInt*>(ptr.get())->content;
+            oss << static_cast<NumberInt*>(ptr)->content;
             break;
         case ValueCategory::NumberFloat:
-            dump_double(oss, static_cast<NumberFloat*>(ptr.get())->content);
+            dump_double(oss, static_cast<NumberFloat*>(ptr)->content);
             break;
         case ValueCategory::String:
-            dump_string(oss, static_cast<String*>(ptr.get())->content);
+            dump_string(oss, static_cast<String*>(ptr)->content);
             break;
         case ValueCategory::Object:
             oss << '{';
