@@ -63,11 +63,13 @@ void test_containers() {
 
     const auto& view = object;
     CHECK(view[std::string("name")].as_string() == "a");
+    CHECK(view["name"].as_string() == "a");
     CHECK(view.at("array").at(std::size_t{0}) == 1);
     const auto size = object.size();
     test::throws<std::runtime_error>([&] { view[std::string("absent")]; },
                                      "absent");
     test::throws<std::runtime_error>([&] { object.at("absent"); }, "absent");
+    test::throws<std::runtime_error>([&] { view["absent"]; }, "absent");
     CHECK(object.size() == size);
     test::throws<std::runtime_error>([&] { object["array"][-1]; }, "-1");
     test::throws<std::runtime_error>([&] { view.at("array")[9]; }, "9");
@@ -83,19 +85,20 @@ void test_containers() {
     array[1]["child"] = "value";
     CHECK(array[1]["child"].as_string() == "value");
     CHECK(Value::create_array().empty() && Value::create_object().empty());
-    CHECK(Value{""}.as_string().empty() && Value{"abc"}.as_string().size() == 3);
+    CHECK(Value{""}.as_string().empty() &&
+          Value{"abc"}.as_string().size() == 3);
 }
 
 void test_copy_and_round_trip() {
     const auto original = parse(R"({"a":[1,{"x":"old"}],"b":true})");
     auto copy = original;
     copy["a"][1]["x"] = "new";
-    CHECK(original[std::string("a")][1][std::string("x")].as_string() == "old");
+    CHECK(original["a"][1]["x"].as_string() == "old");
     CHECK(copy != original);
     Value assigned;
     assigned = original;
     assigned["a"][0] = 9;
-    CHECK(original[std::string("a")][0] == 1);
+    CHECK(original["a"][0] == 1);
     auto clone = original.clone();
     CHECK(clone == original);
     auto& same = clone;
@@ -186,6 +189,8 @@ void test_invalid_documents() {
                                "\"raw\nline\""}) {
         test::throws<std::runtime_error>([&] { parse(source); });
     }
+    test::throws<std::runtime_error>(
+        [] { parse(R"({"ok":[1,{"x":"owned"}],"bad":[2,]})"); });
     const std::string too_deep =
         std::string(520, '[') + '0' + std::string(520, ']');
     test::throws<std::runtime_error>([&] { parse(too_deep); },
@@ -203,10 +208,9 @@ void test_invalid_documents() {
 
 void test_input_sources() {
     const auto fixture = json::parse_file(TEST_SOURCE_DIR "/test.json");
-    CHECK(fixture[std::string("a")] == 42.42 &&
-          fixture[std::string("bs")][0] == 1);
-    CHECK(fixture[std::string("obj")][std::string("empty_array")].empty());
-    CHECK(fixture[std::string("primitives")][0].as_boolean());
+    CHECK(fixture["a"] == 42.42 && fixture["bs"][0] == 1);
+    CHECK(fixture["obj"]["empty_array"].empty());
+    CHECK(fixture["primitives"][0].as_boolean());
     test::throws<std::runtime_error>(
         [] { json::parse_file(TEST_SOURCE_DIR "/test.json.missing"); },
         "not found");

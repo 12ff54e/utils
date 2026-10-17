@@ -235,6 +235,7 @@ struct Value {
     // on a const Value an object key cannot be auto-created; a missing key
     // throws instead (same as at())
     const Value& operator[](const std::string&) const;
+    const Value& operator[](const char*) const;
 
     const Value& at(const std::string&) const;
     const Value& at(std::size_t) const;
@@ -336,7 +337,7 @@ struct Value {
               [](const void* data) { delete static_cast<const T*>(data); }),
           value_cat(cat) {}
 
-    friend class JsonParser;
+    friend struct JsonParser;
 
     std::unique_ptr<void, std::function<void(void*)>> ptr;
     ValueCategory value_cat;
@@ -591,6 +592,9 @@ Value& Value::operator[](const char* key) {
     return as_object()[key];
 }
 const Value& Value::operator[](const std::string& key) const {
+    return at(key);
+}
+const Value& Value::operator[](const char* key) const {
     return at(key);
 }
 
@@ -1297,12 +1301,12 @@ Value JsonParser::parse_primitive(const JsonLexer::Token& token) {
 }
 
 Value JsonParser::parse_object() {
-    auto obj = new Object;
+    auto obj = std::make_unique<Object>();
     auto token = try_peek_from_lexer();
     // empty object
     if (token.name == JsonLexer::TokenName::BRACE_RIGHT) {
         try_get_from_lexer();
-        return {ValueCategory::Object, obj};
+        return {ValueCategory::Object, obj.release()};
     }
     while (true) {
         auto key = try_get_and_check(JsonLexer::TokenName::STRING);
@@ -1314,16 +1318,16 @@ Value JsonParser::parse_object() {
             report_syntax_error(token);
         }
     }
-    return {ValueCategory::Object, obj};
+    return {ValueCategory::Object, obj.release()};
 }
 
 Value JsonParser::parse_array() {
-    auto arr = new Array;
+    auto arr = std::make_unique<Array>();
     auto token = try_peek_from_lexer();
     // empty array
     if (token.name == JsonLexer::TokenName::BRACKET_RIGHT) {
         try_get_from_lexer();
-        return {ValueCategory::Array, arr};
+        return {ValueCategory::Array, arr.release()};
     }
     while (true) {
         arr->content.emplace_back(parse_value());
@@ -1333,7 +1337,7 @@ Value JsonParser::parse_array() {
             report_syntax_error(token);
         }
     }
-    return {ValueCategory::Array, arr};
+    return {ValueCategory::Array, arr.release()};
 }
 
 JsonLexer::Token JsonParser::try_get_and_check(
