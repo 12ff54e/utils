@@ -1,4 +1,4 @@
-#include "../ode.h"
+#include "numerics/ode.h"
 
 #include <cmath>
 #include <cstdlib>

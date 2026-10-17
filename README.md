@@ -1,15 +1,25 @@
 STB style header only utility library, including:
 
-* Timer
-* Json parser
-* **C**ommand **L**ine **A**rgument **P**arser
-* [ODE solver](#ode-solver): explicit and implicit Runge–Kutta methods
+* [`misc/Timer.h`](misc/Timer.h): named timers
+* [`io/JsonParser.h`](io/JsonParser.h): JSON parser
+* [`io/clap.h`](io/clap.h): **C**ommand **L**ine **A**rgument **P**arser
+* [`numerics/ode.h`](numerics/ode.h): [ODE solver](#ode-solver)
+
+## Tests
+
+Build and run the CPU tests with `make -C test check`. Tests use C++20 and the
+standard library. Select a library with `check-json`, `check-timer`, or
+`check-ode`. Override `CXX`, `CPPFLAGS`, `CXXFLAGS`, `LDFLAGS`, `LDLIBS`, or
+`BLD` as needed; build files go under `test/build` by default. The `cuda`
+target builds optional device tests; `check-ode-cuda` also runs them and
+needs a working CUDA device.
 
 ## ODE solver
 
-[`ode.h`](ode.h) is a standalone C++20 header extracted from GEPT. Copy it
-into your include path and use namespace `ode`. It needs only the C++ standard
-library: no GEPT, build system, linked library, or implementation macro.
+[`numerics/ode.h`](numerics/ode.h) is a standalone C++20 header extracted from
+GEPT. Copy it into your include path and use namespace `ode`. It needs only
+the C++ standard library: no GEPT, build system, linked library, or
+implementation macro.
 
 A single header suits this library: the numerical code is templated over the
 scalar, tableau, state, and system, so its definitions must be visible to
@@ -25,6 +35,11 @@ each translation unit; splitting it would mainly help navigation if it grows.
 | `LobattoIIIA4Tableau<T>` | 4 | 3 | Yes |
 | `LobattoIIIB4Tableau<T>` | 4 | 3 | Yes |
 | `Gauss4Tableau<T>` | 4 | 2 | Yes |
+| `Gauss6Tableau<T>` through `Gauss12Tableau<T>` | 6, 8, 10, 12 | 3–6 | Yes |
+
+The header also provides partitioned integrators (Verlet, Lobatto IIIA–IIIB,
+implicit midpoint, and Boris), Newton iteration, stage predictors, and root
+events. These APIs share the same header and have no GEPT dependency.
 
 ### Fixed steps
 
@@ -83,9 +98,11 @@ bool accepted = solver.step(y, 0.1, Decay{}, y, cache, norm,
                             ode::FixedPointOptions<double>{1e-13, 100});
 ```
 
-The implicit solve uses fixed-point iteration, not Newton iteration: even an
-implicit tableau can require small steps for convergence on stiff problems.
+The implicit solve uses fixed-point iteration by default: even an implicit
+tableau can require small steps for convergence on stiff problems.
 Its default tolerance is `32 * epsilon(T)` with at most 100 iterations.
+Pass `ode::NewtonOptions<T>` in place of `ode::FixedPointOptions<T>` to use
+damped Newton iteration with a finite-difference Jacobian.
 The norm must return a finite, nonnegative distance for valid states and a
 nonfinite result for invalid states. Choose its scales and tolerance for your
 problem. Omitting the cache starts each step cold. Keep one cache per trajectory
@@ -102,7 +119,7 @@ inside caller-supplied systems or norms.
 
 ### Adaptive steps
 
-Explicit methods provide host-only step doubling:
+Explicit methods provide step doubling on CPU and CUDA:
 
 ```cpp
 double h = 0.25;
@@ -111,14 +128,16 @@ bool accepted = ode::Integrator<double>{}.step_adaptive(
 ```
 
 The arguments after `h` are the maximum step and upper/lower error bounds.
-Use finite, positive steps and upper bounds, with `0 <= lower <= upper`.
+Use a finite, nonzero step, a positive maximum step and upper error bound,
+and `0 <= lower <= upper`. Negative steps integrate backward.
 On success, the state is the result of two half steps and **`h` is the next
 proposed step**, which may differ from the distance just advanced. Track time
-in the state if it matters. Nonpositive steps or upper bounds and out-of-range
-lower bounds throw `std::invalid_argument`. Finiteness is a caller precondition;
-failed trials leave the caller's state and `h` unchanged.
+in the state if it matters. Invalid options throw `std::invalid_argument` on
+CPU and return `false` on CUDA. Failed trials leave the caller's state and
+`h` unchanged.
 
-All three built-in implicit methods provide Stoffer's symmetric step selection:
+The built-in implicit Runge–Kutta methods provide Stoffer's symmetric step
+selection:
 
 ```cpp
 double h = 0.1;  // Initial guess; negative selects backward integration.
@@ -148,14 +167,14 @@ defect. See the built-in tableaux for their storage and coefficient conventions.
 
 ### CUDA and tests
 
-Fixed steps, stage recording, caching, and symmetric implicit adaptive steps
+Fixed steps, stage recording, caching, and adaptive steps
 are callable from CUDA kernels. Mark the system and norm functions
 `__host__ __device__` and compile with C++20 and `--expt-relaxed-constexpr`
 for standard-library array access. CPU compilation needs no CUDA toolkit.
-Explicit step doubling is host-only because its option validation throws.
+Invalid explicit adaptive options return `false` in device code.
 
 Run the standalone numerical tests with `make -C test check-ode`; optional
 device tests use `make -C test check-ode-cuda` (override `NVCC`, `CUDAFLAGS`,
 or `BLD` as needed). Tests cover convergence, nonautonomous systems, float and
 double, custom tableaux, cached predictors, reversibility, invariants, and
-failure preservation. The CUDA test executes all built-in methods on a device.
+failure preservation. The CUDA tests compare device results with CPU results.

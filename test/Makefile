@@ -1,28 +1,55 @@
-CXXFLAGS = -std=c++20 -Wall
+CXXFLAGS ?= -std=c++20 -O2 -Wall -Wextra -Wpedantic
 NVCC ?= nvcc
 CUDAFLAGS ?= -std=c++20 --expt-relaxed-constexpr -O2
 
-BLD = build
+BLD ?= build
+INCLUDES = -I.. -DTEST_SOURCE_DIR='"$(CURDIR)"'
 TEST_SRCS = $(wildcard *.cpp)
 TESTS = $(addprefix $(BLD)/, $(basename $(TEST_SRCS)))
+ODE_TESTS = $(addprefix $(BLD)/, $(basename $(wildcard ode*_test.cpp)))
+CUDA_TESTS = $(addprefix $(BLD)/, $(basename $(wildcard *_test.cu)))
+DEPS = $(addsuffix .d, $(TESTS) $(CUDA_TESTS))
 
 all: $(TESTS)
 
-.PHONY: all check-ode check-ode-cuda
+.PHONY: all check check-json check-timer check-ode cuda \
+        check-ode-cuda clean
 
-check-ode: $(BLD)/ode_test
-	$(BLD)/ode_test
+check: $(TESTS)
+	@set -e; for test in $(TESTS); do \
+	    printf 'Running %s\n' "$$test"; "$$test"; \
+	done
 
-check-ode-cuda: $(BLD)/ode_cuda_test
-	$(BLD)/ode_cuda_test
+check-json: $(BLD)/json_test
+	$<
 
-$(BLD)/ode_test: ../ode.h
+check-timer: $(BLD)/timer_test
+	$<
 
-$(BLD)/ode_cuda_test: ode_cuda_test.cu ../ode.h | $(BLD)
-	$(NVCC) $(CUDAFLAGS) $< -o $@
+check-ode: $(ODE_TESTS)
+	@set -e; for test in $(ODE_TESTS); do \
+	    printf 'Running %s\n' "$$test"; "$$test"; \
+	done
 
-$(TESTS):$(BLD)/%: %.cpp | $(BLD)
-	$(CXX) $(CXXFLAGS) $< -o $@
+cuda: $(CUDA_TESTS)
+
+check-ode-cuda: cuda
+	@set -e; for test in $(CUDA_TESTS); do \
+	    printf 'Running %s\n' "$$test"; "$$test"; \
+	done
+
+$(BLD)/%: %.cpp | $(BLD)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(INCLUDES) -MMD -MP -MF $@.d \
+	    -MT $@ $< $(LDFLAGS) $(LDLIBS) -o $@
+
+$(BLD)/%: %.cu | $(BLD)
+	$(NVCC) $(CPPFLAGS) $(CUDAFLAGS) $(INCLUDES) -MMD -MF $@.d \
+	    $< $(LDFLAGS) $(LDLIBS) -o $@
 
 $(BLD):
 	mkdir -p $@
+
+clean:
+	$(RM) $(TESTS) $(CUDA_TESTS) $(DEPS)
+
+-include $(DEPS)
