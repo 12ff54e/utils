@@ -31,7 +31,7 @@ struct LinkDecay {
     }
 };
 
-json::Value value_from_other_file();
+json::Value value_from_other_file(json::Value::allocator_type = {});
 Timer& timer_from_other_file();
 int count_from_other_file();
 double step_from_other_file();

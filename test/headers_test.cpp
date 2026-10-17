@@ -8,6 +8,11 @@ int main() {
         const auto value = value_from_other_file();
         CHECK(value["count"] == 7 && value["ok"].as_boolean());
         CHECK(json::parse(value.dump()) == value);
+        CHECK(dynamic_cast<json::Arena*>(value.get_allocator().resource()));
+        json::Arena arena(128);
+        const auto custom = value_from_other_file(&arena);
+        CHECK(custom == value);
+        CHECK(custom["count"].get_allocator().resource() == &arena);
         CHECK(&Timer::get_timer() == &timer_from_other_file());
         CHECK(count_from_other_file() == 7);
         CHECK(CLAP<LinkOptions>::get_options().contains("--count"));

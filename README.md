@@ -16,7 +16,7 @@ flags, for example `make -C test CXX=clang++ BLD=build/clang check`.
 
 | Library | Checks |
 | --- | --- |
-| JSON | Values, containers, copies, Unicode, round trips, files, malformed input, and nesting limits |
+| JSON | Values, containers, copies, Unicode, round trips, files, malformed input, nesting limits, arenas, custom resources, lifetimes, and allocation failures |
 | CLAP | Every registration form, supported types, defaults, positional arguments, diagnostics, and the `--help` exit path |
 | Timer | Named and nested timers, accumulation, switching, reset, and printed results |
 | ODE | Convergence, scalar precision, fixed and adaptive steps, Newton solves, predictors, partitioned methods, invariants, reversibility, and events |
@@ -39,6 +39,55 @@ The `cuda` target builds five optional device tests; `check-ode-cuda` also
 runs them and fails if device discovery fails or no device is present. CPU
 checks need no CUDA toolkit. Override `NVCC` and `CUDAFLAGS` as needed;
 include `-ccbin /path/to/g++` in `CUDAFLAGS` if NVCC needs another host compiler.
+
+## JSON parser
+
+Define `ZQ_JSON_PARSER_IMPLEMENTATION` before including `io/JsonParser.h` in
+one source file. JSON storage uses `json::Allocator<T>`, backed by a
+`std::pmr::memory_resource`. Each default document owns a `json::Arena` that
+allocates in 4096-byte blocks and frees the blocks when its last owner dies.
+Values, strings, object keys, arrays, object entries, and complex typed arrays
+use the chosen resource. Lexer tokens, input streams, diagnostics, and output
+formatting use standard library scratch storage.
+
+```cpp
+#define ZQ_JSON_PARSER_IMPLEMENTATION
+#include "io/JsonParser.h"
+
+auto document = json::parse(R"({"items":[1,2,3]})");
+
+// Borrow any standard or custom memory_resource. It must outlive its values.
+std::pmr::unsynchronized_pool_resource pool;
+auto custom = json::parse(R"({"name":"example"})", &pool);
+custom["items"] = json::Value::create_array(3);  // Uses pool too.
+
+// Share ownership when values need to outlive the caller's resource handle.
+auto arena = std::make_shared<json::Arena>(8192);
+auto shared = json::parse(R"(["retained storage"])", arena);
+arena.reset();
+```
+
+`parse`, `parse_file`, `JsonParser`, value constructors, and the `create_*`
+factories accept an optional allocator. Pass a resource pointer, a resource
+`shared_ptr`, or a `json::Allocator<T>`. `get_allocator()` returns the value's
+allocator. Copy construction and `clone()` copy the contents and share the
+source resource; `clone(allocator)` copies into another resource. Copy and move
+assignment keep the destination resource. Moves between unequal resources copy
+the contents before clearing the source; allocation failure preserves both
+values. A move source must not contain its destination.
+
+Accessors return allocator-aware types: `json::string_type`,
+`Value::array_container_type`, `Value::object_container_type`, and
+`TypedArray<T>::container_type`. Use these aliases or `auto` for stored
+references. String values accept `std::string`, literals, and `string_view`;
+`std::string(value)` makes an ordinary string copy. Extracted values, strings,
+and containers retain an owned resource, so even a small extracted value can
+keep a whole arena alive.
+
+`Arena` accepts a block size and an optional upstream resource. Individual
+deallocations do nothing. Destroy all objects using its storage before calling
+`release()`; the arena can then be reused. An arena is not synchronized, and
+its upstream resource must outlive it.
 
 ## ODE solver
 

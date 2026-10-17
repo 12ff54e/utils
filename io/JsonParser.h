@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <iterator>
 #include <limits>
 #include <memory>  // unique_ptr
 #include <memory_resource>
@@ -147,13 +148,35 @@ struct NumberFloat {
 struct Boolean {
     bool content;
 };
+using string_type =
+    std::basic_string<char, std::char_traits<char>, Allocator<char>>;
+
+// Allow comparisons with std::string as well as literals and string_view.
+inline bool operator==(const string_type& lhs, std::string_view rhs) noexcept {
+    return std::string_view(lhs) == rhs;
+}
+
+struct StringHash {
+    using is_transparent = void;
+    std::size_t operator()(std::string_view key) const noexcept {
+        return std::hash<std::string_view>{}(key);
+    }
+};
+struct StringEqual {
+    using is_transparent = void;
+    bool operator()(std::string_view lhs, std::string_view rhs) const noexcept {
+        return lhs == rhs;
+    }
+};
+
 struct String {
-    std::string content;
+    string_type content;
 };
 template <typename T>
 struct TypedArray {
     using value_type = T;
-    std::vector<T> content;
+    using container_type = std::vector<T, Allocator<T>>;
+    container_type content;
 };
 
 /**
@@ -184,30 +207,59 @@ struct Value {
     }
 
    public:
-    using object_container_type = std::unordered_map<std::string, Value>;
-    using array_container_type = std::vector<Value>;
+    using allocator_type = Allocator<std::byte>;
+    using string_type = json::string_type;
+    using object_container_type =
+        std::unordered_map<string_type,
+                           Value,
+                           StringHash,
+                           StringEqual,
+                           Allocator<std::pair<const string_type, Value>>>;
+    using array_container_type = std::vector<Value, Allocator<Value>>;
     Value();
+    explicit Value(allocator_type);
+    explicit Value(std::pmr::memory_resource* resource)
+        : Value(allocator_type(resource)) {}
 
     template <std::integral T>
-    Value(T val) : Value(ValueCategory::NumberInt, new NumberInt{val}) {}
+    Value(T val, allocator_type allocator = {})
+        : Value(make_node_<NumberInt>(ValueCategory::NumberInt,
+                                      allocator,
+                                      NumberInt{static_cast<int64_t>(val)})) {}
 
     template <std::floating_point T>
-    Value(T val) : Value(ValueCategory::NumberFloat, new NumberFloat{val}) {}
+    Value(T val, allocator_type allocator = {})
+        : Value(
+              make_node_<NumberFloat>(ValueCategory::NumberFloat,
+                                      allocator,
+                                      NumberFloat{static_cast<double>(val)})) {}
 
-    // Non-template overloads are needed for bool and strings: bool is an
-    // integral type, so the template above would otherwise store `true` as
-    // the number 1, and there was no way to build a String Value at all.
-    Value(bool);
-    Value(std::string);
-    Value(const char*);
+    // bool needs its own overload because it also satisfies std::integral.
+    Value(bool, allocator_type = {});
+    Value(std::string, allocator_type = {});
+    Value(std::string_view, allocator_type = {});
+    Value(const char*, allocator_type = {});
 
+    // Copies share the resource, but own independent contents.
     Value clone() const;
+    Value clone(allocator_type) const;
+    allocator_type get_allocator() const noexcept { return allocator_; }
 
     Value(const Value&);
+    Value(const Value&, allocator_type);
+    Value(Value&&) noexcept;
+    Value(Value&&, allocator_type);
+    // Assignments keep the destination allocator.
     Value& operator=(const Value&);
+    // The move source must not contain the destination.
+    Value& operator=(Value&&);
 
-    Value(Value&&) = default;
-    Value& operator=(Value&&) = default;
+    // Used by allocator-aware containers, including default array elements.
+    Value(std::allocator_arg_t, allocator_type allocator)
+        : Value(std::move(allocator)) {}
+    template <typename T>
+    Value(std::allocator_arg_t, allocator_type allocator, T&& val)
+        : Value(std::forward<T>(val), std::move(allocator)) {}
 
     // NOTE: Can not cast to any integer type due to an annoying C builtin
     // operator[](ptrdiff_t, const char*), as far as I still want to support
@@ -234,8 +286,8 @@ struct Value {
         return T{};
     }
 
-    std::string& as_string();
-    const std::string& as_string() const;
+    string_type& as_string();
+    const string_type& as_string() const;
 
     template <typename T>
     bool operator<(
@@ -266,10 +318,9 @@ struct Value {
                 static_cast<NumberInt*>(ptr.get())                            \
                     ->content a_op static_cast<int64_t>(val);                 \
             } else {                                                          \
-                *this = Value{                                                \
-                    ValueCategory::NumberFloat,                               \
-                    new NumberFloat{                                          \
-                        static_cast<NumberInt*>(ptr.get())->content op val}}; \
+                *this =                                                       \
+                    Value{static_cast<NumberInt*>(ptr.get())->content op val, \
+                          allocator_};                                        \
             }                                                                 \
         }                                                                     \
     } while (0)
@@ -292,27 +343,29 @@ struct Value {
             if constexpr (std::is_integral_v<std::remove_reference_t<T>>) {
                 static_cast<NumberInt*>(ptr.get())->content = val;
             } else {
-                *this = Value{ValueCategory::NumberFloat, new NumberFloat{val}};
+                *this = Value{static_cast<double>(val), allocator_};
             }
         } else if (value_cat == ValueCategory::NumberFloat) {
             static_cast<NumberFloat*>(ptr.get())->content = val;
         } else {
             if constexpr (std::is_integral_v<std::remove_reference_t<T>>) {
-                *this = Value{ValueCategory::NumberInt, new NumberInt{val}};
+                *this = Value{static_cast<int64_t>(val), allocator_};
             } else {
-                *this = Value{ValueCategory::NumberFloat, new NumberFloat{val}};
+                *this = Value{static_cast<double>(val), allocator_};
             }
         }
         return *this;
     }
 
     template <typename T>
-    decltype(auto) operator=(
-        T val) requires std::convertible_to<T, std::string> {
-        if (value_cat == ValueCategory::String) {
-            static_cast<String*>(ptr.get())->content = val;
+    Value& operator=(const T& val)
+        requires(std::convertible_to<const T&, std::string_view> ||
+                 std::convertible_to<const T&, std::string>)
+    {
+        if constexpr (std::convertible_to<const T&, std::string_view>) {
+            assign_string_(std::string_view(val));
         } else {
-            *this = Value{ValueCategory::String, new String{val}};
+            assign_string_(std::string(val));
         }
         return *this;
     }
@@ -339,17 +392,17 @@ struct Value {
         }
     }
 
-    Value& operator[](const std::string&);
+    Value& operator[](std::string_view);
     Value& operator[](const char*);
     // on a const Value an object key cannot be auto-created; a missing key
     // throws instead (same as at())
-    const Value& operator[](const std::string&) const;
+    const Value& operator[](std::string_view) const;
     const Value& operator[](const char*) const;
 
-    const Value& at(const std::string&) const;
+    const Value& at(std::string_view) const;
     const Value& at(std::size_t) const;
 
-    Value& at(const std::string&);
+    Value& at(std::string_view);
     Value& at(std::size_t);
 
     const object_container_type& as_object() const;
@@ -359,7 +412,7 @@ struct Value {
     array_container_type& as_array();
 
     template <typename T>
-    const std::vector<T>& as_typed_array() const {
+    const typename TypedArray<T>::container_type& as_typed_array() const {
         static_assert(
             std::is_same_v<T, std::complex<float>> ||
                 std::is_same_v<T, std::complex<double>>,
@@ -372,7 +425,7 @@ struct Value {
     }
 
     template <typename T>
-    std::vector<T>& as_typed_array() {
+    typename TypedArray<T>::container_type& as_typed_array() {
         static_assert(
             std::is_same_v<T, std::complex<float>> ||
                 std::is_same_v<T, std::complex<double>>,
@@ -394,7 +447,7 @@ struct Value {
     bool is_null() const;
     bool is_typed_array() const;
     // false when the value is not an object
-    bool contains(const std::string& key) const;
+    bool contains(std::string_view key) const;
 
     std::size_t size() const;
     bool empty() const;
@@ -407,52 +460,90 @@ struct Value {
     // formatted output
     std::string pretty_print(std::size_t = 0) const;
 
-    static Value create_object();
-    static Value create_array(std::size_t n = 0);
+    static Value create_object(allocator_type = {});
+    static Value create_array(std::size_t n = 0, allocator_type = {});
 
     template <typename T>
-    static Value create_typed_array() {
+    static Value create_typed_array(allocator_type allocator = {}) {
         static_assert(
             std::is_same_v<T, std::complex<float>> ||
                 std::is_same_v<T, std::complex<double>>,
             "create_typed_array only supports std::complex<float> and "
             "std::complex<double>");
-        return {std::is_same_v<T, std::complex<float>>
-                    ? ValueCategory::TypedArrayComplexFloat
-                    : ValueCategory::TypedArrayComplexDouble,
-                new TypedArray<T>};
+        return make_node_<TypedArray<T>>(
+            std::is_same_v<T, std::complex<float>>
+                ? ValueCategory::TypedArrayComplexFloat
+                : ValueCategory::TypedArrayComplexDouble,
+            allocator,
+            TypedArray<T>{typename TypedArray<T>::container_type(allocator)});
     }
 
-    template <typename T>
-    static Value create_typed_array(std::vector<T> vec) {
+    template <typename T, typename SourceAllocator>
+    static Value create_typed_array(std::vector<T, SourceAllocator> vec,
+                                    allocator_type allocator = {}) {
         static_assert(
             std::is_same_v<T, std::complex<float>> ||
                 std::is_same_v<T, std::complex<double>>,
             "create_typed_array only supports std::complex<float> and "
             "std::complex<double>");
-        return {std::is_same_v<T, std::complex<float>>
-                    ? ValueCategory::TypedArrayComplexFloat
-                    : ValueCategory::TypedArrayComplexDouble,
-                new TypedArray<T>{std::move(vec)}};
+        Value result = create_typed_array<T>(allocator);
+        auto& content = result.as_typed_array<T>();
+        if constexpr (std::same_as<SourceAllocator, Allocator<T>>) {
+            content = std::move(vec);
+        } else {
+            content.assign(std::make_move_iterator(vec.begin()),
+                           std::make_move_iterator(vec.end()));
+        }
+        return result;
     }
 
    private:
-    // internal constructor: takes ownership of the heap-allocated content
-    // object; the deleter is type-erased, so passing a category that does
-    // not match the dynamic type of T* would be UB
-    template <typename T>
-    Value(ValueCategory cat, T* raw_ptr)
-        : ptr(raw_ptr,
-              [](const void* data) { delete static_cast<const T*>(data); }),
-          value_cat(cat) {}
+    struct NodeDeleter {
+        std::pmr::memory_resource* resource{};
+        void (*destroy)(void*, std::pmr::memory_resource*) noexcept {};
+        void operator()(void* data) const noexcept { destroy(data, resource); }
+    };
+
+    template <typename T, typename... Args>
+    static Value make_node_(ValueCategory cat,
+                            allocator_type allocator,
+                            Args&&... args) {
+        Value result(allocator);
+        Allocator<T> node_allocator(allocator);
+        auto* node = node_allocator.allocate(1);
+        try {
+            std::construct_at(node, std::forward<Args>(args)...);
+        } catch (...) {
+            node_allocator.deallocate(node, 1);
+            throw;
+        }
+        result.ptr = std::unique_ptr<void, NodeDeleter>(
+            node,
+            NodeDeleter{
+                allocator.resource(),
+                [](void* data, std::pmr::memory_resource* resource) noexcept {
+                    auto* typed = static_cast<T*>(data);
+                    std::destroy_at(typed);
+                    resource->deallocate(typed, sizeof(T), alignof(T));
+                }});
+        result.value_cat = cat;
+        return result;
+    }
 
     friend struct JsonParser;
 
-    std::unique_ptr<void, std::function<void(void*)>> ptr;
-    ValueCategory value_cat;
+    // The resource owner must outlive payload and container destruction.
+    allocator_type allocator_;
+    std::unique_ptr<void, NodeDeleter> ptr{nullptr, NodeDeleter{}};
+    ValueCategory value_cat = ValueCategory::Null;
+
+    void assign_string_(std::string_view);
+    void take_payload_(Value&) noexcept;
+    void swap_payload_(Value&) noexcept;
+    void clear_() noexcept;
 
     static void print_space(std::ostream&, std::size_t);
-    static void dump_string(std::ostream&, const std::string&);
+    static void dump_string(std::ostream&, std::string_view);
     // shortest round-trip representation, e.g. "0.1" not "0.10000000000000001"
     static void dump_double(std::ostream&, double);
 };
@@ -521,11 +612,13 @@ struct JsonLexer {
 std::ostream& operator<<(std::ostream& os, const JsonLexer::Token& token);
 
 struct JsonParser {
-    JsonParser(JsonLexer&&);
+    using allocator_type = Value::allocator_type;
+    JsonParser(JsonLexer&&, allocator_type = {});
     Value parse();
 
    private:
     JsonLexer lexer;
+    allocator_type allocator_;
     // guards against stack overflow on hostile/degenerate input
     static constexpr std::size_t MAX_NESTING_DEPTH = 512;
     std::size_t depth{};
@@ -544,9 +637,9 @@ struct JsonParser {
     void report_syntax_error(const JsonLexer::Token& = {});
 };
 
-Value parse(std::string);
-Value parse(std::istream&);
-Value parse_file(std::string);
+Value parse(std::string, Value::allocator_type = {});
+Value parse(std::istream&, Value::allocator_type = {});
+Value parse_file(std::string, Value::allocator_type = {});
 
 }  // namespace json
 
@@ -640,28 +733,89 @@ const char* get_value_category_name(ValueCategory val_cat) {
     return "";  // unreachable
 }
 
-Value::Value() : value_cat{} {}
+Value::Value() : Value(allocator_type{}) {}
+Value::Value(allocator_type allocator) : allocator_(std::move(allocator)) {}
 
-Value::Value(const Value& other) : Value() { *this = other; }
+Value::Value(const Value& other) : Value(other.clone()) {}
+Value::Value(const Value& other, allocator_type allocator)
+    : Value(other.clone(std::move(allocator))) {}
 
-// Deep copy of every category (the old version only accepted "plain" values
-// and threw for Object/Array, which made `Value b = obj;` fail at runtime
-// for no visible reason; use clone() only if you prefer to spell it out)
+Value::Value(Value&& other) noexcept
+    : allocator_(other.allocator_),
+      ptr(std::move(other.ptr)),
+      value_cat(std::exchange(other.value_cat, ValueCategory::Null)) {}
+
+Value::Value(Value&& other, allocator_type allocator)
+    : Value(std::move(allocator)) {
+    if (allocator_ == other.allocator_) {
+        take_payload_(other);
+    } else {
+        auto copy = other.clone(allocator_);
+        other.clear_();
+        swap_payload_(copy);
+    }
+}
+
 Value& Value::operator=(const Value& other) {
-    if (this != &other) { *this = other.clone(); }
+    if (this != &other) {
+        auto copy = other.clone(allocator_);
+        swap_payload_(copy);
+    }
     return *this;
 }
 
-Value::Value(bool val) : Value(ValueCategory::Boolean, new Boolean{val}) {}
-Value::Value(std::string val)
-    : Value(ValueCategory::String, new String{std::move(val)}) {}
-Value::Value(const char* val) : Value(std::string(val)) {}
+Value& Value::operator=(Value&& other) {
+    if (this != &other) {
+        // Stage the source before destroying this payload: it may be a child.
+        Value moved(std::move(other), allocator_);
+        swap_payload_(moved);
+    }
+    return *this;
+}
+
+void Value::clear_() noexcept {
+    ptr.reset();
+    value_cat = ValueCategory::Null;
+}
+
+void Value::take_payload_(Value& other) noexcept {
+    ptr = std::move(other.ptr);
+    ptr.get_deleter().resource = allocator_.resource();
+    value_cat = std::exchange(other.value_cat, ValueCategory::Null);
+}
+
+void Value::swap_payload_(Value& other) noexcept {
+    ptr.swap(other.ptr);
+    std::swap(value_cat, other.value_cat);
+}
+
+Value::Value(bool val, allocator_type allocator)
+    : Value(make_node_<Boolean>(ValueCategory::Boolean,
+                                allocator,
+                                Boolean{val})) {}
+Value::Value(std::string val, allocator_type allocator)
+    : Value(std::string_view(val), std::move(allocator)) {}
+Value::Value(std::string_view val, allocator_type allocator)
+    : Value(make_node_<String>(
+          ValueCategory::String,
+          allocator,
+          String{string_type(val, Allocator<char>(allocator))})) {}
+Value::Value(const char* val, allocator_type allocator)
+    : Value(std::string_view(val), std::move(allocator)) {}
+
+void Value::assign_string_(std::string_view val) {
+    if (value_cat == ValueCategory::String) {
+        static_cast<String*>(ptr.get())->content.assign(val);
+    } else {
+        *this = Value{val, allocator_};
+    }
+}
 
 Value& Value::operator=(bool val) {
     if (value_cat == ValueCategory::Boolean) {
         static_cast<Boolean*>(ptr.get())->content = val;
     } else {
-        *this = Value{val};
+        *this = Value{val, allocator_};
     }
     return *this;
 }
@@ -729,40 +883,44 @@ bool Value::operator==(const Value& other) const {
     return false;  // unreachable
 }
 
-std::string& Value::as_string() {
+Value::string_type& Value::as_string() {
     expected_cat(ValueCategory::String);
     return static_cast<String*>(ptr.get())->content;
 }
-const std::string& Value::as_string() const {
+const Value::string_type& Value::as_string() const {
     expected_cat(ValueCategory::String);
     return static_cast<String*>(ptr.get())->content;
 }
 
 Value::operator std::string() const {
-    expected_cat(ValueCategory::String);
-    return static_cast<String*>(ptr.get())->content;
+    const auto& str = as_string();
+    return std::string(str.data(), str.size());
 }
 
-Value& Value::operator[](const std::string& key) {
-    return as_object()[key];
+Value& Value::operator[](std::string_view key) {
+    auto& object = as_object();
+    if (auto found = object.find(key); found != object.end()) {
+        return found->second;
+    }
+    return object.try_emplace(string_type(key, object.get_allocator()))
+        .first->second;
 }
 Value& Value::operator[](const char* key) {
-    return as_object()[key];
+    return operator[](std::string_view(key));
 }
-const Value& Value::operator[](const std::string& key) const {
+const Value& Value::operator[](std::string_view key) const {
     return at(key);
 }
 const Value& Value::operator[](const char* key) const {
     return at(key);
 }
 
-const Value& Value::at(const std::string& key) const {
-    try {
-        return as_object().at(key);
-    } catch (const std::out_of_range&) {
-        // only wrap a missing key; type errors keep their real message
-        throw std::runtime_error("Failed to access key: " + key);
+const Value& Value::at(std::string_view key) const {
+    const auto& object = as_object();
+    if (auto found = object.find(key); found != object.end()) {
+        return found->second;
     }
+    throw std::runtime_error("Failed to access key: " + std::string(key));
 }
 const Value& Value::at(std::size_t idx) const {
     try {
@@ -773,12 +931,8 @@ const Value& Value::at(std::size_t idx) const {
     }
 }
 
-Value& Value::at(const std::string& key) {
-    try {
-        return as_object().at(key);
-    } catch (const std::out_of_range&) {
-        throw std::runtime_error("Failed to access key: " + key);
-    }
+Value& Value::at(std::string_view key) {
+    return const_cast<Value&>(std::as_const(*this).at(key));
 }
 Value& Value::at(std::size_t idx) {
     try {
@@ -830,7 +984,7 @@ bool Value::is_typed_array() const {
     return value_cat == ValueCategory::TypedArrayComplexFloat ||
            value_cat == ValueCategory::TypedArrayComplexDouble;
 }
-bool Value::contains(const std::string& key) const {
+bool Value::contains(std::string_view key) const {
     return is_object() && as_object().contains(key);
 }
 
@@ -885,21 +1039,20 @@ std::string Value::dump() const {
         const auto result = std::to_chars(buf, buf + sizeof buf, part);
         oss.write(buf, result.ptr - buf);
     };
-    auto dump_typed_array =
-        [&oss, &dump_complex_part]<typename T>(
-            const std::vector<T>& typed_array) {
+    auto dump_typed_array = [&oss, &dump_complex_part]<typename T, typename A>(
+                                const std::vector<T, A>& typed_array) {
+        oss << '[';
+        for (std::size_t i = 0; i < typed_array.size(); ++i) {
+            const auto& val = typed_array[i];
+            if (i) { oss << ','; }
             oss << '[';
-            for (std::size_t i = 0; i < typed_array.size(); ++i) {
-                const auto& val = typed_array[i];
-                if (i) { oss << ','; }
-                oss << '[';
-                dump_complex_part(val.real());
-                oss << ',';
-                dump_complex_part(val.imag());
-                oss << ']';
-            }
+            dump_complex_part(val.real());
+            oss << ',';
+            dump_complex_part(val.imag());
             oss << ']';
-        };
+        }
+        oss << ']';
+    };
 
     switch (value_cat) {
         case ValueCategory::Null:
@@ -951,29 +1104,29 @@ std::string Value::pretty_print(std::size_t indent) const {
         const auto result = std::to_chars(buf, buf + sizeof buf, part);
         oss.write(buf, result.ptr - buf);
     };
-    auto print_typed_array =
-        [&oss, indent, &dump_complex_part]<typename T>(
-            const std::vector<T>& typed_array) {
-            oss << "[\n";
-            for (std::size_t i = 0; i < typed_array.size(); ++i) {
-                const auto& val = typed_array[i];
-                if (i) { oss << ",\n"; }
-                print_space(oss, indent + 4);
-                oss << '[';
-                dump_complex_part(val.real());
-                oss << ", ";
-                dump_complex_part(val.imag());
-                oss << ']';
-            }
-            if (typed_array.empty()) {
-                oss.seekp(-1, std::ios_base::cur);
-                oss << ' ';
-            } else {
-                oss << '\n';
-                print_space(oss, indent);
-            }
+    auto print_typed_array = [&oss, indent,
+                              &dump_complex_part]<typename T, typename A>(
+                                 const std::vector<T, A>& typed_array) {
+        oss << "[\n";
+        for (std::size_t i = 0; i < typed_array.size(); ++i) {
+            const auto& val = typed_array[i];
+            if (i) { oss << ",\n"; }
+            print_space(oss, indent + 4);
+            oss << '[';
+            dump_complex_part(val.real());
+            oss << ", ";
+            dump_complex_part(val.imag());
             oss << ']';
-        };
+        }
+        if (typed_array.empty()) {
+            oss.seekp(-1, std::ios_base::cur);
+            oss << ' ';
+        } else {
+            oss << '\n';
+            print_space(oss, indent);
+        }
+        oss << ']';
+    };
 
     switch (value_cat) {
         case ValueCategory::Null:
@@ -1027,45 +1180,53 @@ std::string Value::pretty_print(std::size_t indent) const {
 }
 
 Value Value::clone() const {
+    return clone(allocator_);
+}
+
+Value Value::clone(allocator_type allocator) const {
     switch (value_cat) {
         case ValueCategory::NumberInt:
-            return {value_cat, new NumberInt{
-                                   static_cast<NumberInt*>(ptr.get())
-                                       ->content}};
-            break;
+            return Value(as_number<int64_t>(), allocator);
         case ValueCategory::NumberFloat:
-            return {value_cat, new NumberFloat{as_number<double>()}};
-            break;
+            return Value(as_number<double>(), allocator);
         case ValueCategory::Boolean:
-            return {value_cat, new Boolean{as_boolean()}};
-            break;
+            return Value(as_boolean(), allocator);
         case ValueCategory::String:
-            return {value_cat, new String{as_string()}};
-            break;
+            return Value(std::string_view(as_string()), allocator);
         case ValueCategory::Array: {
-            auto arr = new Array;
-            for (const auto& value : as_array()) {
-                arr->content.push_back(value.clone());
-            }
-            return {value_cat, arr};
+            auto result = create_array(0, allocator);
+            auto& array = result.as_array();
+            array.reserve(size());
+            for (const auto& value : as_array()) { array.emplace_back(value); }
+            return result;
         }
         case ValueCategory::Object: {
-            auto obj = new Object;
-            for (const auto& [key, val] : as_object()) {
-                obj->content.emplace(key, val.clone());
+            auto result = create_object(allocator);
+            auto& object = result.as_object();
+            object.reserve(size());
+            for (const auto& [key, value] : as_object()) {
+                object.emplace(key, value);
             }
-            return {value_cat, obj};
+            return result;
         }
-        case ValueCategory::TypedArrayComplexFloat:
-            return {value_cat, new TypedArray<std::complex<float>>{
-                                   as_typed_array<std::complex<float>>()}};
-        case ValueCategory::TypedArrayComplexDouble:
-            return {value_cat, new TypedArray<std::complex<double>>{
-                                   as_typed_array<std::complex<double>>()}};
+        case ValueCategory::TypedArrayComplexFloat: {
+            auto result = create_typed_array<std::complex<float>>(allocator);
+            const auto& source = as_typed_array<std::complex<float>>();
+            result.as_typed_array<std::complex<float>>().assign(source.begin(),
+                                                                source.end());
+            return result;
+        }
+        case ValueCategory::TypedArrayComplexDouble: {
+            auto result = create_typed_array<std::complex<double>>(allocator);
+            const auto& source = as_typed_array<std::complex<double>>();
+            result.as_typed_array<std::complex<double>>().assign(source.begin(),
+                                                                 source.end());
+            return result;
+        }
         case ValueCategory::Null:
-            break;
+            return Value(allocator);
     }
-    return {value_cat, new Null{}};
+    return Value(allocator);
 }
 
 void Value::print_space(std::ostream& os, std::size_t indent) {
@@ -1078,7 +1239,7 @@ void Value::dump_double(std::ostream& os, double val) {
     os.write(buf, result.ptr - buf);
 }
 
-void Value::dump_string(std::ostream& os, const std::string& str) {
+void Value::dump_string(std::ostream& os, std::string_view str) {
     os << '"';
     for (const char ch : str) {
         if (ch == '"' || ch == '\\') {
@@ -1105,11 +1266,14 @@ void Value::dump_string(std::ostream& os, const std::string& str) {
     os << '"';
 }
 
-Value Value::create_object() {
-    return {ValueCategory::Object, new Object{}};
+Value Value::create_object(allocator_type allocator) {
+    return make_node_<Object>(ValueCategory::Object, allocator,
+                              Object{object_container_type(allocator)});
 }
-Value Value::create_array(std::size_t n) {
-    return {ValueCategory::Array, new Array{array_container_type(n)}};
+Value Value::create_array(std::size_t n, allocator_type allocator) {
+    return make_node_<Array>(
+        ValueCategory::Array, allocator,
+        Array{array_container_type(n, Allocator<Value>(allocator))});
 }
 
 JsonLexer::JsonLexer(std::istream& is, std::string file_name)
@@ -1324,7 +1488,8 @@ void JsonLexer::append_utf8(std::string& out, uint32_t code_point) {
     }
 }
 
-JsonParser::JsonParser(JsonLexer&& json_lexer) : lexer(std::move(json_lexer)) {}
+JsonParser::JsonParser(JsonLexer&& json_lexer, allocator_type allocator)
+    : lexer(std::move(json_lexer)), allocator_(std::move(allocator)) {}
 
 Value JsonParser::parse() {
     if (!lexer) { report_syntax_error(); }  // token list is empty
@@ -1343,7 +1508,7 @@ Value JsonParser::parse_value() {
         throw std::runtime_error(oss.str());
     }
     ++depth;
-    Value result;
+    Value result(allocator_);
     switch (token.name) {
         case JsonLexer::TokenName::STRING:
             result = parse_string(token);
@@ -1374,7 +1539,7 @@ Value JsonParser::parse_string(const JsonLexer::Token& token) {
     if (token.name != JsonLexer::TokenName::STRING) {
         report_syntax_error(token);
     }
-    return {ValueCategory::String, new String{token.content}};
+    return Value(token.content, allocator_);
 }
 
 Value JsonParser::parse_int(const JsonLexer::Token& token) {
@@ -1402,7 +1567,7 @@ Value JsonParser::parse_int(const JsonLexer::Token& token) {
     errno = 0;
     const long long content = std::strtoll(str, nullptr, 10);
     if (errno == ERANGE) { report_syntax_error(token); }
-    return {ValueCategory::NumberInt, new NumberInt{content}};
+    return Value(content, allocator_);
 }
 Value JsonParser::parse_float(const JsonLexer::Token& token) {
     if (token.name != JsonLexer::TokenName::FLOAT) {
@@ -1446,56 +1611,54 @@ Value JsonParser::parse_float(const JsonLexer::Token& token) {
     if (errno == ERANGE || !std::isfinite(content)) {
         report_syntax_error(token);
     }
-    return {ValueCategory::NumberFloat, new NumberFloat{content}};
+    return Value(content, allocator_);
 }
 Value JsonParser::parse_primitive(const JsonLexer::Token& token) {
     if (token.name != JsonLexer::TokenName::PRIMITIVE) {
         report_syntax_error(token);
     }
-    if (token.content.front() == 'n') {
-        return {ValueCategory::Null, new Null{}};
-    }
-    return {ValueCategory::Boolean, new Boolean{token.content.front() == 't'}};
+    if (token.content.front() == 'n') { return Value(allocator_); }
+    return Value(token.content.front() == 't', allocator_);
 }
 
 Value JsonParser::parse_object() {
-    auto obj = std::make_unique<Object>();
+    auto obj = Value::create_object(allocator_);
     auto token = try_peek_from_lexer();
     // empty object
     if (token.name == JsonLexer::TokenName::BRACE_RIGHT) {
         try_get_from_lexer();
-        return {ValueCategory::Object, obj.release()};
+        return obj;
     }
     while (true) {
         auto key = try_get_and_check(JsonLexer::TokenName::STRING);
         try_get_and_check(JsonLexer::TokenName::COLON);
-        obj->content.emplace(key.content, parse_value());  // value
+        obj.as_object().emplace(key.content, parse_value());
         token = try_get_from_lexer();
         if (token.name == JsonLexer::TokenName::BRACE_RIGHT) { break; }
         if (token.name != JsonLexer::TokenName::COMMA) {
             report_syntax_error(token);
         }
     }
-    return {ValueCategory::Object, obj.release()};
+    return obj;
 }
 
 Value JsonParser::parse_array() {
-    auto arr = std::make_unique<Array>();
+    auto arr = Value::create_array(0, allocator_);
     auto token = try_peek_from_lexer();
     // empty array
     if (token.name == JsonLexer::TokenName::BRACKET_RIGHT) {
         try_get_from_lexer();
-        return {ValueCategory::Array, arr.release()};
+        return arr;
     }
     while (true) {
-        arr->content.emplace_back(parse_value());
+        arr.as_array().emplace_back(parse_value());
         token = try_get_from_lexer();
         if (token.name == JsonLexer::TokenName::BRACKET_RIGHT) { break; }
         if (token.name != JsonLexer::TokenName::COMMA) {
             report_syntax_error(token);
         }
     }
-    return {ValueCategory::Array, arr.release()};
+    return arr;
 }
 
 JsonLexer::Token JsonParser::try_get_and_check(
@@ -1561,20 +1724,20 @@ std::ostream& operator<<(std::ostream& os, const JsonLexer::Token& token) {
               << token.row << ", " << token.col << ')' << " }";
 }
 
-Value parse(std::istream& is) {
-    return JsonParser{is}.parse();
+Value parse(std::istream& is, Value::allocator_type allocator) {
+    return JsonParser{is, std::move(allocator)}.parse();
 }
 
-Value parse(std::string str) {
+Value parse(std::string str, Value::allocator_type allocator) {
     std::stringstream ss;
     ss.str(str);
-    return parse(ss);
+    return parse(ss, std::move(allocator));
 }
 
-Value parse_file(std::string filename) {
+Value parse_file(std::string filename, Value::allocator_type allocator) {
     std::ifstream ifs(filename);  // Its destructor will close the file
     if (!ifs) { throw std::runtime_error("File " + filename + " not found"); }
-    return JsonParser{JsonLexer{ifs, filename}}.parse();
+    return JsonParser{JsonLexer{ifs, filename}, std::move(allocator)}.parse();
 }
 
 }  // namespace json
