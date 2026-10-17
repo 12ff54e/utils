@@ -103,6 +103,10 @@ struct CLAP {
     static void assign_value(char* adr,
                              CLAP_TYPE_CODE type_code,
                              const std::string& raw_value) {
+        if (type_code == CLAP_TYPE_CODE::string_t) {
+            *reinterpret_cast<string*>(adr) = raw_value;
+            return;
+        }
         std::istringstream iss(raw_value);
 #define PROCESS_TYPE(TYPE)                    \
     case (CLAP_TYPE_CODE::TYPE##_t): {        \
@@ -351,34 +355,35 @@ struct CLAP {
         return EINVAL;                                                 \
     }
 
-#define CLAP_REGISTER_OPT_MINIMAL(NAME)                                      \
-    {                                                                        \
-        auto result = get_options().emplace(                                 \
-            "--" #NAME, CLAP_OptionConfig{offsetof(base, NAME),              \
-                                          get_type_code<decltype(NAME)>()}); \
-        if (!result.second) { report_repeat_definition(OPTION_NAME); }       \
+#define CLAP_REGISTER_OPT_MINIMAL(NAME)                                  \
+    {                                                                    \
+        auto result = get_options().emplace(                             \
+            "--" #NAME,                                                  \
+            CLAP_OptionConfig{offsetof(base, NAME),                      \
+                              get_type_code<decltype(NAME)>(), "", ""}); \
+        if (!result.second) { report_repeat_definition("--" #NAME); }    \
     }
 
-#define CLAP_REGISTER_OPT_LONG(NAME, OPTION_NAME)                             \
-    {                                                                         \
-        auto option_name = process_option(OPTION_NAME);                       \
-        auto result = get_options().emplace(                                  \
-            option_name, CLAP_OptionConfig{offsetof(base, NAME),              \
-                                           get_type_code<decltype(NAME)>()}); \
-        if (!result.second) { report_repeat_definition(option_name); }        \
+#define CLAP_REGISTER_OPT_LONG(NAME, OPTION_NAME)                        \
+    {                                                                    \
+        auto option_name = process_option(OPTION_NAME);                  \
+        auto result = get_options().emplace(                             \
+            option_name,                                                 \
+            CLAP_OptionConfig{offsetof(base, NAME),                      \
+                              get_type_code<decltype(NAME)>(), "", ""}); \
+        if (!result.second) { report_repeat_definition(option_name); }   \
     }
 
-#define CLAP_REGISTER_OPT_LONG_SHORT(NAME, OPTION_NAME, OPTION_NAME_SHORT) \
-    {                                                                      \
-        auto option_name = process_option(OPTION_NAME);                    \
-        auto option_name_short = process_option(OPTION_NAME_SHORT, true);  \
-        auto result = get_options().emplace(                               \
-            option_name,                                                   \
-            CLAP_OptionConfig{offsetof(base, NAME),                        \
-                              get_type_code<decltype(NAME)>(),             \
-                              process_option(option_name_short, false)});  \
-        if (!result.second) { report_repeat_definition(option_name); }     \
-        get_short_name_map().emplace(option_name_short, result.first);     \
+#define CLAP_REGISTER_OPT_LONG_SHORT(NAME, OPTION_NAME, OPTION_NAME_SHORT)  \
+    {                                                                       \
+        auto option_name = process_option(OPTION_NAME);                     \
+        auto option_name_short = process_option(OPTION_NAME_SHORT, true);   \
+        auto result = get_options().emplace(                                \
+            option_name, CLAP_OptionConfig{offsetof(base, NAME),            \
+                                           get_type_code<decltype(NAME)>(), \
+                                           option_name_short, ""});         \
+        if (!result.second) { report_repeat_definition(option_name); }      \
+        get_short_name_map().emplace(option_name_short, result.first);      \
     }
 
 #define CLAP_REGISTER_OPT_DESC(NAME, DESC)                                 \
@@ -415,9 +420,9 @@ struct CLAP {
 // Macro overloading depending on argument number
 // https://stackoverflow.com/a/11763277/7255197
 #define CLAP_GET_MACRO_3(_1, _2, _3, NAME, ...) NAME
-#define CLAP_REGISTER_OPTION(...)                                       \
-    CLAP_GET_MACRO(__VA_ARGS__, CLAP_REGISTER_OPT_LONG_SHORT,           \
-                   CLAP_REGISTER_OPT_LONG, CLAP_REGISTER_OPT_MINIMAL, ) \
+#define CLAP_REGISTER_OPTION(...)                                         \
+    CLAP_GET_MACRO_3(__VA_ARGS__, CLAP_REGISTER_OPT_LONG_SHORT,           \
+                     CLAP_REGISTER_OPT_LONG, CLAP_REGISTER_OPT_MINIMAL, ) \
     (__VA_ARGS__)
 
 #define CLAP_GET_MACRO_4(_1, _2, _3, _4, NAME, ...) NAME

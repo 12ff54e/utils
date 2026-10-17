@@ -12,10 +12,10 @@ DEPS = $(addsuffix .d, $(TESTS) $(CUDA_TESTS))
 
 all: $(TESTS)
 
-.PHONY: all check check-json check-timer check-ode cuda \
+.PHONY: all check check-json check-timer check-clap check-clap-help check-ode cuda \
         check-ode-cuda clean
 
-check: $(TESTS)
+check: $(TESTS) check-clap-help
 	@set -e; for test in $(TESTS); do \
 	    printf 'Running %s\n' "$$test"; "$$test"; \
 	done
@@ -25,6 +25,13 @@ check-json: $(BLD)/json_test
 
 check-timer: $(BLD)/timer_test
 	$<
+
+check-clap: $(BLD)/clap_test check-clap-help
+	$<
+
+check-clap-help: $(BLD)/clap_test
+	$< --help > $(BLD)/clap_help.txt
+	$< --check-help $(BLD)/clap_help.txt
 
 check-ode: $(ODE_TESTS)
 	@set -e; for test in $(ODE_TESTS); do \
@@ -50,6 +57,6 @@ $(BLD):
 	mkdir -p $@
 
 clean:
-	$(RM) $(TESTS) $(CUDA_TESTS) $(DEPS)
+	$(RM) $(TESTS) $(CUDA_TESTS) $(DEPS) $(BLD)/clap_help.txt
 
 -include $(DEPS)

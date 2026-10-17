@@ -8,9 +8,10 @@ STB style header only utility library, including:
 ## Tests
 
 Build and run the CPU tests with `make -C test check`. Tests use C++20 and the
-standard library. Select a library with `check-json`, `check-timer`, or
-`check-ode`. Override `CXX`, `CPPFLAGS`, `CXXFLAGS`, `LDFLAGS`, `LDLIBS`, or
-`BLD` as needed; build files go under `test/build` by default. The `cuda`
+standard library. Select a library with `check-json`, `check-clap`,
+`check-timer`, or `check-ode`. Override `CXX`, `CPPFLAGS`, `CXXFLAGS`,
+`LDFLAGS`, `LDLIBS`, or `BLD` as needed; build files go under `test/build`
+by default. The `cuda`
 target builds optional device tests; `check-ode-cuda` also runs them and
 needs a working CUDA device.
 
