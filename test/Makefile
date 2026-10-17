@@ -8,12 +8,15 @@ TEST_SRCS = $(wildcard *.cpp)
 TESTS = $(addprefix $(BLD)/, $(basename $(TEST_SRCS)))
 ODE_TESTS = $(addprefix $(BLD)/, $(basename $(wildcard ode*_test.cpp)))
 CUDA_TESTS = $(addprefix $(BLD)/, $(basename $(wildcard *_test.cu)))
-DEPS = $(addsuffix .d, $(TESTS) $(CUDA_TESTS))
+HEADER_SRCS = headers_test.cpp $(wildcard link/*.cpp)
+HEADER_OBJS = $(addprefix $(BLD)/, $(HEADER_SRCS:.cpp=.o))
+DEPS = $(addsuffix .d, $(filter-out $(BLD)/headers_test, $(TESTS)) $(CUDA_TESTS)) \
+       $(HEADER_OBJS:.o=.d)
 
 all: $(TESTS)
 
-.PHONY: all check check-json check-timer check-clap check-clap-help check-ode cuda \
-        check-ode-cuda clean
+.PHONY: all check check-json check-timer check-clap check-clap-help \
+        check-headers check-ode cuda check-ode-cuda clean
 
 check: $(TESTS) check-clap-help
 	@set -e; for test in $(TESTS); do \
@@ -33,6 +36,9 @@ check-clap-help: $(BLD)/clap_test
 	$< --help > $(BLD)/clap_help.txt
 	$< --check-help $(BLD)/clap_help.txt
 
+check-headers: $(BLD)/headers_test
+	$<
+
 check-ode: $(ODE_TESTS)
 	@set -e; for test in $(ODE_TESTS); do \
 	    printf 'Running %s\n' "$$test"; "$$test"; \
@@ -44,6 +50,14 @@ check-ode-cuda: cuda
 	@set -e; for test in $(CUDA_TESTS); do \
 	    printf 'Running %s\n' "$$test"; "$$test"; \
 	done
+
+$(BLD)/headers_test: $(HEADER_OBJS)
+	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) $(LDLIBS) -o $@
+
+$(BLD)/%.o: %.cpp | $(BLD)
+	@mkdir -p $(@D)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(INCLUDES) -MMD -MP \
+	    -MF $(@:.o=.d) -MT $@ -c $< -o $@
 
 $(BLD)/%: %.cpp | $(BLD)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(INCLUDES) -MMD -MP -MF $@.d \
@@ -57,6 +71,6 @@ $(BLD):
 	mkdir -p $@
 
 clean:
-	$(RM) $(TESTS) $(CUDA_TESTS) $(DEPS) $(BLD)/clap_help.txt
+	$(RM) $(TESTS) $(CUDA_TESTS) $(HEADER_OBJS) $(DEPS) $(BLD)/clap_help.txt
 
 -include $(DEPS)

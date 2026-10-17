@@ -11,9 +11,34 @@ Build and run the CPU tests with `make -C test check`. Tests use C++20 and the
 standard library. Select a library with `check-json`, `check-clap`,
 `check-timer`, or `check-ode`. Override `CXX`, `CPPFLAGS`, `CXXFLAGS`,
 `LDFLAGS`, `LDLIBS`, or `BLD` as needed; build files go under `test/build`
-by default. The `cuda`
-target builds optional device tests; `check-ode-cuda` also runs them and
-needs a working CUDA device.
+by default. Use a separate build directory when changing the compiler or
+flags, for example `make -C test CXX=clang++ BLD=build/clang check`.
+
+| Library | Checks |
+| --- | --- |
+| JSON | Values, containers, copies, Unicode, round trips, files, malformed input, and nesting limits |
+| CLAP | Every registration form, supported types, defaults, positional arguments, diagnostics, and the `--help` exit path |
+| Timer | Named and nested timers, accumulation, switching, reset, and printed results |
+| ODE | Convergence, scalar precision, fixed and adaptive steps, Newton solves, predictors, partitioned methods, invariants, reversibility, and events |
+
+`check-headers` compiles and links consumers in separate source files, with
+JSON and Timer implementation macros each defined in one source file. It
+also checks shared CLAP registration and ODE template use across those files.
+The ODE tests and shared CPU/CUDA checks were adapted from GEPT; all fixtures
+live here, so running them does not require a GEPT checkout.
+
+Run address, leak, and undefined-behavior checks with:
+
+```bash
+make -C test CXX=clang++ BLD=build/sanitize CPPFLAGS=-DNDEBUG \
+  CXXFLAGS='-std=c++20 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer' \
+  check
+```
+
+The `cuda` target builds five optional device tests; `check-ode-cuda` also
+runs them and fails if device discovery fails or no device is present. CPU
+checks need no CUDA toolkit. Override `NVCC` and `CUDAFLAGS` as needed;
+include `-ccbin /path/to/g++` in `CUDAFLAGS` if NVCC needs another host compiler.
 
 ## ODE solver
 

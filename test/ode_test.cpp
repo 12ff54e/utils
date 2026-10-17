@@ -1,4 +1,5 @@
 #include "numerics/ode.h"
+#include "ode/finite_error.h"
 
 #include <cmath>
 #include <cstdlib>
@@ -577,10 +578,10 @@ void test_adaptive_pendulum_accuracy() {
             check(h > 0 && h <= cap && state.time > initial_time,
                   "adaptive pendulum must advance within its step bound");
             if (cap == 0.5) minimum_h = std::min(minimum_h, h);
-            maximum_h = std::max(maximum_h, h);
+            maximum_h = ode_test::finite_max(maximum_h, h);
             const double energy = state.p * state.p / 2 + 1 - std::cos(state.q);
-            max_energy_error = std::max(max_energy_error,
-                                        std::abs(energy / initial_energy - 1));
+            max_energy_error = ode_test::finite_max(
+                max_energy_error, std::abs(energy / initial_energy - 1));
         }
         check(maximum_h / minimum_h > 1.2,
               "nonlinear orbit must use meaningfully varying step sizes");
@@ -676,7 +677,7 @@ int main() {
         return EXIT_FAILURE;
     }
 
-    if (std::abs(integrate<float>(0.05F) - std::exp(1.0F)) > 1.0e-5F) {
+    if (!(std::abs(integrate<float>(0.05F) - std::exp(1.0F)) <= 1.0e-5F)) {
         std::cerr << "float RK4 integration is inaccurate\n";
         return EXIT_FAILURE;
     }

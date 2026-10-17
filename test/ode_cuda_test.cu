@@ -1,6 +1,6 @@
 #include "numerics/ode.h"
 
-#include <cuda_runtime.h>
+#include "ode/cuda_support.h"
 
 #include <cmath>
 #include <cstdlib>
@@ -151,8 +151,8 @@ void test_method(const char* name) {
                                                       : 5e-10;
     const double agreement = std::is_same_v<T, float> ? 1e-4 : 1e-11;
     if (result.fixed.time != 1 ||
-        std::abs(result.fixed.value - std::exp(1.5)) > tolerance ||
-        std::abs(result.fixed.value - host.fixed.value) > agreement)
+        !(std::abs(result.fixed.value - std::exp(1.5)) <= tolerance) ||
+        !(std::abs(result.fixed.value - host.fixed.value) <= agreement))
         throw std::runtime_error(
             "CUDA fixed step disagrees with exact/CPU solution");
 
@@ -162,10 +162,11 @@ void test_method(const char* name) {
         const double adaptive_tolerance =
             std::is_same_v<T, float> ? 2e-5 : 1e-7;
         if (!(result.h > 0 && result.h < T{0.5}) || t != result.h ||
-            std::abs(result.adaptive.value - std::exp(t + t * t / 2)) >
-                adaptive_tolerance ||
-            std::abs(result.h - host.h) > agreement ||
-            std::abs(result.adaptive.value - host.adaptive.value) > agreement)
+            !(std::abs(result.adaptive.value - std::exp(t + t * t / 2)) <=
+              adaptive_tolerance) ||
+            !(std::abs(result.h - host.h) <= agreement) ||
+            !(std::abs(result.adaptive.value - host.adaptive.value) <=
+              agreement))
             throw std::runtime_error(
                 "CUDA adaptive step disagrees with exact/CPU solution");
     }
@@ -184,6 +185,7 @@ void test_precision() {
 }  // namespace
 
 int main() {
+    if (!ode_test::require_cuda_device()) return EXIT_FAILURE;
     std::cout << std::setprecision(16);
     try {
         test_precision<double>();
